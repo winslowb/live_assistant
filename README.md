@@ -1,36 +1,94 @@
 # Live Assistant (TUI)
 
-Self-contained terminal UI for live transcription (Vosk/ffmpeg) and AI analysis.
+Self‑contained terminal UI for live audio capture, optional on‑device transcription (Vosk/ffmpeg), and AI analysis in a split‑pane curses interface. Sessions are recorded to disk and summarized into Markdown.
 
-This directory is intended to be the project root for the Python app. In this repo it currently boots the main implementation that lives one directory up; to fully decouple into a separate repo, copy `live_assistant_main.py` and the `prompt_library/` directory into this folder (see Standalone mode below).
+This folder is the project root. The launcher prefers a local `live_assistant_main.py` and falls back to the repository‑root copy if present.
 
-## Quick Start
+**What it does**
+- Captures audio from a PulseAudio source via `ffmpeg` and saves `audio.wav`.
+- Performs live ASR with Vosk (if a model is available), showing transcript on the left.
+- Streams rolling analysis on the right: actions, questions, decisions, and topics.
+- Adds markers and free‑form notes during recording.
+- Supports an “Interview” mode to capture a question, then auto‑answer with an LLM.
+- Writes Markdown notes and an optional executive summary at the end of the session.
 
-Dependencies: ffmpeg, pactl (PulseAudio), Python 3, and optionally Vosk model.
+**Outputs**
+- `~/recordings/session_YYYYmmdd_HHMMSS/`
+  - `audio.wav` – raw mono 16 kHz PCM recording
+  - `notes_YYYYmmdd_HHMMSS.md` – session report (metadata, lists, Q&A, summary)
+  - `assistant.log` – internal log
 
-- Run: `python3 live_assistant/live_assistant.py`
-- Or: `bash live_assistant/install_and_run.sh`
+**Requirements**
+- `python3`, `ffmpeg`, `pactl` (PulseAudio), terminal that supports curses.
+- Python packages: `vosk` (optional, for live ASR), `requests` (for LLM calls).
+- Optional: Vosk model directory (e.g., `~/.cache/vosk-model-small-en-us-0.15`).
 
-The app will prompt for audio devices and (optionally) an LLM model. Notes are saved under `~/recordings/session_YYYYmmdd_HHMMSS/`.
+**Quick Start**
+- Run directly: `python3 live_assistant/live_assistant.py`
+- Or installer: `bash live_assistant/install_and_run.sh`
+  - Installs system and pip deps (Debian/Ubuntu), downloads a Vosk model by default.
 
-## CLI flags
+The app will prompt for capture/playback devices and an optional LLM model. Notes are saved under `~/recordings/session_YYYYmmdd_HHMMSS/`.
 
-- `--source` <pulse_source_name>
-- `--sink` <pulse_sink_name>
-- `--vosk-model-path` <dir>
-- `--llm-model` <model>
-- `--openai-base-url` <url>
+**CLI Flags**
+- `--source` `<pulse_source_name>` – capture source (e.g., a monitor for system audio)
+- `--sink` `<pulse_sink_name>` – playback sink (optional)
+- `--vosk-model-path` `<dir>` – Vosk model directory (enables live ASR)
+- `--llm-model` `<name>` – model name for analysis (e.g., `gpt-4o-mini`)
+- `--openai-base-url` `<url>` – OpenAI‑compatible API base URL
 
-Flags override env and skip interactive prompts.
+Flags override environment and skip interactive prompts. View help: `python3 live_assistant/live_assistant.py --help`.
 
-## Standalone mode (decoupled repo)
+**Environment Variables**
+- `OPENAI_API_KEY` – enables LLM analysis and executive summary
+- `OPENAI_BASE_URL` – override base URL (optional)
+- `LLM_MODEL` / `OPENAI_MODEL` – default model if not passed via CLI
+- `VOSK_MODEL_PATH` – default Vosk model directory
+- `PROMPT_DIR` – extra directory to scan for prompt `.md` files
+- `SUMMARY_PROMPT` – path to a specific summary prompt `.md`
 
-To make this directory fully standalone (e.g., its own `live_assistant` repo):
+**Prompt Library**
+- Prompts are discovered in `prompt_library/` and any directory containing “prompt”.
+- At startup, you can pick a summary/analysis template. Setting `SUMMARY_PROMPT` bypasses the picker.
+- Choosing an “interview” prompt enables interview mode (see Shortcuts).
 
-1) Move/copy into this directory from the parent project:
-   - `../live_assistant_main.py`
-   - `../prompt_library/` (entire folder)
-2) After copying, running `python3 live_assistant/live_assistant.py` will use the local `live_assistant_main.py` automatically.
+**Shortcuts (TUI)**
+- `q` – quit
+- `m` – add a timestamped marker
+- `n` – add a free‑form note (Enter save, Esc cancel, Backspace delete)
+- `j` / `k` – scroll transcript pane
+- `/` – search transcript and jump to first match
+- `\` – filter transcript lines by substring
+- `i` – interview mode: start/stop capturing a question; answer is generated via LLM
 
-Until then, the launcher falls back to the parent directory’s `live_assistant_main.py` and `prompt_library/`.
+**Audio Devices (PulseAudio)**
+- List sources: `pactl list short sources`
+- List sinks: `pactl list short sinks`
+- Use `--source` and `--sink` to avoid interactive selection in non‑TTY contexts.
+
+**Installation Notes**
+- Script‑based: `install_and_run.sh` handles `apt`, `pip`, and Vosk model download.
+- Manual pip: `python3 -m pip install --upgrade vosk requests`
+- Vosk models (examples):
+  - Small: `~/.cache/vosk-model-small-en-us-0.15`
+  - Medium: `~/.cache/vosk-model-en-us-0.22`
+
+**Executive Summary**
+- After quitting the TUI, a longer summary can be generated if `OPENAI_API_KEY` is set.
+- Uses the full transcript (last slice) with a structured prompt; output is added to the notes file.
+
+**Standalone Mode (decoupled repo)**
+- To fully decouple from the parent repo, copy into this folder:
+  - `../live_assistant_main.py`
+  - `../prompt_library/` (entire folder)
+- The launcher (`live_assistant.py`) prefers the local copy; otherwise it falls back to the parent.
+
+**Troubleshooting**
+- “No PulseAudio sources found” or connection refused:
+  - Ensure PulseAudio is running and accessible from your environment.
+  - In containers/WSL, you may need to forward PulseAudio or use a null source.
+- No live transcript but recording works:
+  - Verify `vosk` is installed and `--vosk-model-path` points to a valid model dir.
+- TUI fails to draw in non‑interactive environments:
+  - Run from a real terminal; pass flags to skip interactive prompts when needed.
 
