@@ -1,0 +1,1176 @@
+#!/usr/bin/env python3
+import os
+import sys
+import time
+import json
+import threading
+import subprocess
+from datetime import datetime
+import curses
+import textwrap
+from typing import Optional, List, Tuple
+from pathlib import Path
+import wave
+import argparse
+
+# Optional Vosk import
+try:
+    import vosk  # type: ignore
+except Exception:
+    vosk = None
+
+
+def list_pulse_devices(kind: str) -> List[Tuple[str, str]]:
+    try:
+        out = subprocess.check_output(["pactl", "list", "short", kind], text=True)
+    except Exception as e:
+        print(f"[!] Failed to list PulseAudio {kind}: {e}")
+        return []
+    items: List[Tuple[str, str]] = []
+    for line in out.strip().splitlines():
+        parts = line.split('\t')
+        if len(parts) >= 2:
+            idx, name = parts[0], parts[1]
+            items.append((idx, name))
+    return items
+
+
+def choose_from_list(prompt: str, items: List[Tuple[str, str]]) -> Optional[str]:
+    if not items:
+        print("[!] No items available.")
+        return None
+    print(prompt)
+    for i, (_, name) in enumerate(items):
+        print(f"  [{i}] {name}")
+    while True:
+        sel = input("Enter number (or blank to cancel): ").strip()
+        if sel == "":
+            return None
+        if sel.isdigit():
+            i = int(sel)
+            if 0 <= i < len(items):
+                return items[i][1]
+        print("Invalid selection; try again.")
+
+
+def detect_vosk_model() -> Optional[str]:
+    mp = os.environ.get("VOSK_MODEL_PATH")
+    if mp and os.path.isdir(mp):
+        return mp
+    default = os.path.expanduser("~/.cache/vosk-model-small-en-us-0.15")
+    if os.path.isdir(default):
+        return default
+    return None
+
+
+def choose_vosk_model_path() -> Optional[str]:
+    """Prompt user to pick a Vosk model path.
+    Returns a directory path or None to proceed without live ASR.
+    """
+    candidates: List[str] = []
+    for p in [
+        os.environ.get("VOSK_MODEL_PATH"),
+        os.path.expanduser("~/.cache/vosk-model-en-us-0.22"),
+        os.path.expanduser("~/.cache/vosk-model-small-en-us-0.15"),
+    ]:
+        if p and os.path.isdir(p) and p not in candidates:
+            candidates.append(p)
+    print("Select Vosk ASR model (Enter to skip for recording-only):")
+    for i, p in enumerate(candidates):
+        print(f"  [{i}] {p}")
+    try:
+        sel = input("Enter number, a custom path, or blank: ").strip()
+    except EOFError:
+        sel = ""
+    if sel == "":
+        return None
+    if sel.isdigit():
+        idx = int(sel)
+        if 0 <= idx < len(candidates):
+            return candidates[idx]
+        return None
+    if os.path.isdir(sel):
+        return sel
+    print(f"[!] Not a directory: {sel}. Proceeding without live ASR.")
+    return None
+
+
+def discover_prompt_files() -> list[tuple[str, str]]:
+    """Return (display_name, absolute_path) for .md prompts.
+    - Scans typical locations and recursively searches for directories containing 'prompt' (case-insensitive).
+    - Honors PROMPT_DIR env if set.
+    """
+    here = Path(__file__).resolve().parent
+    roots = [here, Path.cwd()]
+    env_dir = os.environ.get('PROMPT_DIR')
+    if env_dir:
+        roots.append(Path(env_dir))
+    candidates: set[Path] = set()
+    # Direct candidates
+    for r in roots:
+        for name in ('prompt_library', 'prompt library', 'prompts', 'Prompt Library'):
+            d = (r / name)
+            if d.is_dir():
+                candidates.add(d)
+    # Recursive: any directory with 'prompt' in its name (depth <= 2)
+    for r in roots:
+        for d in r.rglob('*'):
+            if d.is_dir() and 'prompt' in d.name.lower():
+                # limit depth to avoid scanning huge trees
+                try:
+                    if len(d.relative_to(r).parts) <= 3:
+                        candidates.add(d)
+                except Exception:
+                    pass
+    seen=set()
+    found: list[tuple[str,str]]=[]
+    for d in sorted(candidates):
+        try:
+            for f in sorted(d.glob('*.md')):
+                ap = str(f.resolve())
+                if ap in seen:
+                    continue
+                seen.add(ap)
+                found.append((f.name, ap))
+        except Exception:
+            pass
+    return found
+
+
+
+def choose_summary_prompt() -> str | None:
+    # Env override takes precedence
+    env_path = os.environ.get('SUMMARY_PROMPT')
+    if env_path and Path(env_path).is_file():
+        try:
+            return Path(env_path).read_text(encoding='utf-8')
+        except Exception:
+            pass
+    files = discover_prompt_files()
+    print('Select a summary prompt (Enter to use default):')
+    if files:
+        for i, (name, _) in enumerate(files):
+            print(f'  [{i}] {name}')
+    else:
+        print('  [no prompts found] (type a full path or press Enter)')
+    try:
+        sel = input('Enter number, a custom file path, or blank: ').strip()
+    except EOFError:
+        sel = ''
+    if sel == '':
+        return None
+    path = None
+    if sel.isdigit() and files:
+        i = int(sel)
+        if 0 <= i < len(files):
+            path = files[i][1]
+    else:
+        if Path(sel).is_file():
+            path = sel
+    if not path:
+        print('[!] Invalid selection; using default prompt.')
+        return None
+    try:
+        return Path(path).read_text(encoding='utf-8')
+    except Exception as e:
+        print(f'[!] Failed to read prompt file: {e}')
+        return None
+
+
+def choose_summary_prompt_info() -> tuple[str|None,str|None]:
+    # Env override takes precedence
+    env_path = os.environ.get('SUMMARY_PROMPT')
+    if env_path and Path(env_path).is_file():
+        try:
+            return Path(env_path).read_text(encoding='utf-8'), env_path
+        except Exception:
+            pass
+    files = discover_prompt_files()
+    print('Select a summary prompt (Enter to use default):')
+    if files:
+        for i,(name,_) in enumerate(files):
+            print(f'  [{i}] {name}')
+    else:
+        print('  [no prompts found] (type a full path or press Enter)')
+    try:
+        sel = input('Enter number, a filename, a full path, or blank: ').strip()
+    except EOFError:
+        sel = ''
+    if sel == '':
+        return None, None
+    # By number
+    if sel.isdigit() and files:
+        i=int(sel)
+        if 0<=i<len(files):
+            name, path = files[i]
+            try:
+                return Path(path).read_text(encoding='utf-8'), name
+            except Exception:
+                return None, None
+    # By exact filename (case-insensitive)
+    low = sel.lower()
+    for name, path in files:
+        if name.lower()==low:
+            try:
+                return Path(path).read_text(encoding='utf-8'), name
+            except Exception:
+                return None, None
+    # By path
+    if Path(sel).is_file():
+        try:
+            return Path(sel).read_text(encoding='utf-8'), Path(sel).name
+        except Exception:
+            return None, None
+    print('[!] Invalid selection; using default prompt.')
+    return None, None
+
+
+class SharedState:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.transcript = []
+        self.partial = ''
+        self.analysis = ''
+        self.actions = []
+        self.questions = []
+        self.decisions = []
+        self.topics = []
+        self._seen_actions = set()
+        self._seen_questions = set()
+        self._seen_decisions = set()
+        self._seen_topics = set()
+
+        # Interview mode capture and results
+        self.segment_active = False
+        self.segment_lines: List[str] = []
+        self.segment_partial: str = ''
+        self.qas: List[Tuple[str, str]] = []  # (question, answer)
+
+    _STOPWORDS = set('a an and are as at be been being but by for from had has have how i if in into is it its of on or our over so than that the their them then there these they this to under up was we what when where which who will with you your'.split())
+
+    @staticmethod
+    def _normalize_key(s: str) -> str:
+        import re as _re
+        s = _re.sub(r"[^a-zA-Z0-9\s]", " ", s.lower()).strip()
+        toks = [t for t in s.split() if t and t not in SharedState._STOPWORDS]
+        return " ".join(toks[:10])
+
+    def add_text(self, line: str):
+        with self.lock:
+            self.transcript.append(line)
+            if self.segment_active:
+                self.segment_lines.append(line)
+
+    def set_partial(self, text: str):
+        with self.lock:
+            self.partial = text
+            if self.segment_active:
+                self.segment_partial = text
+
+    def set_analysis(self, text: str):
+        with self.lock:
+            self.analysis = text
+
+    def snapshot(self):
+        with self.lock:
+            return list(self.transcript), self.analysis, self.partial
+
+    # Interview helpers
+    def start_segment(self):
+        with self.lock:
+            self.segment_active = True
+            self.segment_lines = []
+            self.segment_partial = ''
+
+    def stop_segment(self) -> str:
+        with self.lock:
+            self.segment_active = False
+            text = "\n".join(self.segment_lines + ([self.segment_partial] if self.segment_partial else []))
+            self.segment_lines = []
+            self.segment_partial = ''
+            return text.strip()
+
+    def add_qa(self, question: str, answer: str):
+        with self.lock:
+            self.qas.append((question.strip(), answer.strip()))
+            self.analysis = answer.strip()
+
+    def get_qas(self) -> List[Tuple[str, str]]:
+        with self.lock:
+            return list(self.qas)
+
+    def _add_unique(self, lst, seen, items):
+        for it in items:
+            s = it.strip()
+            if not s:
+                continue
+            key = SharedState._normalize_key(s)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            lst.append(s)
+
+    def add_analysis_chunks(self, actions, questions, decisions, topics):
+        with self.lock:
+            self._add_unique(self.actions, self._seen_actions, actions)
+            self._add_unique(self.questions, self._seen_questions, questions)
+            self._add_unique(self.decisions, self._seen_decisions, decisions)
+            self._add_unique(self.topics, self._seen_topics, topics)
+            parts = []
+            if self.actions:
+                parts.append('Action Items:')
+                parts.extend([f'- {a}' for a in self.actions])
+                parts.append('')
+            if self.questions:
+                parts.append('Questions:')
+                parts.extend([f'- {q}' for q in self.questions])
+                parts.append('')
+            if self.decisions:
+                parts.append('Decisions:')
+                parts.extend([f'- {d}' for d in self.decisions])
+                parts.append('')
+            if self.topics:
+                parts.append('Key Topics:')
+                parts.extend([f'- {t}' for t in self.topics])
+                parts.append('')
+            self.analysis = "\n".join(parts).strip()
+
+    def get_lists(self):
+        with self.lock:
+            return (list(self.actions), list(self.questions), list(self.decisions), list(self.topics))
+class LiveTranscriber:
+    def __init__(self, source: str, session_dir: str, model_path: Optional[str], on_text=None, on_partial=None):
+        self.source = source
+        self.session_dir = session_dir
+        self.model_path = model_path
+        self.stop_event = threading.Event()
+        self.transcript_lines: List[str] = []
+        self.markers: List[Tuple[float, str]] = []
+        self.notes: List[Tuple[float, str]] = []
+        self.start_time = time.time()
+        self.engine_label = "none"
+        self.proc: Optional[subprocess.Popen] = None
+        self.writer: Optional[wave.Wave_write] = None
+        self.on_text = on_text
+        self.on_partial = on_partial
+
+        self.has_vosk = False
+        self.recognizer = None
+        if vosk and self.model_path and os.path.isdir(self.model_path):
+            try:
+                model = vosk.Model(self.model_path)
+                self.recognizer = vosk.KaldiRecognizer(model, 16000)
+                self.has_vosk = True
+                self.engine_label = f"vosk:{os.path.basename(self.model_path)}"
+            except Exception as e:
+                print(f"[!] Failed to init Vosk: {e}")
+                self.has_vosk = False
+
+    def _open_wave(self):
+        wav_path = os.path.join(self.session_dir, "audio.wav")
+        wf = wave.open(wav_path, 'wb')
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(16000)
+        self.writer = wf
+
+    def _spawn_ffmpeg(self):
+        cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-f", "pulse", "-i", self.source,
+            "-ac", "1", "-ar", "16000",
+            "-f", "s16le", "-"
+        ]
+        self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    def _sec(self) -> float:
+        return time.time() - self.start_time
+
+    def add_marker(self):
+        t = self._sec()
+        self.markers.append((t, f"marker at {t:0.1f}s"))
+
+    def add_note(self, text: str):
+        t = self._sec()
+        self.notes.append((t, text))
+
+    def run(self) -> threading.Thread:
+        os.makedirs(self.session_dir, exist_ok=True)
+        self._open_wave()
+        self._spawn_ffmpeg()
+        if not self.proc or not self.proc.stdout:
+            print("[!] Failed to start ffmpeg.")
+            return threading.Thread(target=lambda: None)
+
+        def reader():
+            try:
+                while not self.stop_event.is_set():
+                    chunk = self.proc.stdout.read(4000)
+                    if not chunk:
+                        break
+                    if self.writer:
+                        self.writer.writeframes(chunk)
+                    if self.has_vosk and self.recognizer:
+                        try:
+                            if self.recognizer.AcceptWaveform(chunk):
+                                res = json.loads(self.recognizer.Result())
+                                txt = res.get("text", "").strip()
+                                if txt:
+                                    self.transcript_lines.append(txt)
+                                    if self.on_text:
+                                        try:
+                                            self.on_text(txt)
+                                        except Exception:
+                                            pass
+                                if self.on_partial:
+                                    try:
+                                        self.on_partial("")
+                                    except Exception:
+                                        pass
+                            else:
+                                try:
+                                    pres = json.loads(self.recognizer.PartialResult())
+                                    ptxt = pres.get("partial", "").strip()
+                                except Exception:
+                                    ptxt = ""
+                                if self.on_partial is not None:
+                                    try:
+                                        self.on_partial(ptxt)
+                                    except Exception:
+                                        pass
+                        except Exception as e:
+                            print(f"[!] ASR error: {e}")
+            finally:
+                try:
+                    if self.writer:
+                        self.writer.close()
+                except Exception:
+                    pass
+
+        t_reader = threading.Thread(target=reader, daemon=True)
+        t_reader.start()
+        return t_reader
+
+    def write_notes(self, source_label: str, sink_label: Optional[str], llm_model: Optional[str], analysis_text: Optional[str], lists: Optional[Tuple[List[str], List[str], List[str], List[str]]] = None, executive_summary: Optional[str] = None, prompt_label: Optional[str] = None, qas: Optional[List[Tuple[str, str]]] = None):
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        notes_path = os.path.join(self.session_dir, f"notes_{ts}.md")
+        duration = time.time() - self.start_time
+        with open(notes_path, "w", encoding="utf-8") as f:
+            f.write(f"# Session Notes - {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n")
+            f.write("## Metadata\n")
+            f.write(f"- Source: `{source_label}`\n")
+            if sink_label:
+                f.write(f"- Sink: `{sink_label}`\n")
+            f.write(f"- Engine: `{self.engine_label}`\n")
+            if llm_model:
+                f.write(f"- LLM: `{llm_model}`\n")
+            if prompt_label:
+                f.write(f"- Prompt: `{prompt_label}`\n")
+            f.write(f"- Duration: `{time.strftime('%H:%M:%S', time.gmtime(duration))}`\n")
+            f.write(f"- Generated: `{datetime.now().isoformat(timespec='seconds')}`\n\n")
+            if executive_summary:
+                f.write("## Executive Summary\n")
+                f.write(executive_summary.strip() + "\n\n")
+            if analysis_text:
+                f.write("## Live Analysis (final snapshot)\n")
+                f.write(analysis_text)
+                f.write("\n\n")
+            if qas:
+                f.write("## Interview Q&A\n")
+                for i, (q, a) in enumerate(qas, start=1):
+                    f.write(f"\n**Q{i}.** {q}\n\n")
+                    f.write(f"{a}\n")
+                f.write("\n")
+            if lists:
+                actions, questions, decisions, topics = lists
+                f.write("## Action Items\n")
+                if actions:
+                    for a in actions:
+                        f.write(f"- {a}\n")
+                else:
+                    f.write("- None captured.\n")
+                f.write("\n## Questions\n")
+                if questions:
+                    for q in questions:
+                        f.write(f"- {q}\n")
+                else:
+                    f.write("- None captured.\n")
+                f.write("\n## Decisions\n")
+                if decisions:
+                    for d in decisions:
+                        f.write(f"- {d}\n")
+                else:
+                    f.write("- None captured.\n")
+                f.write("\n## Key Topics\n")
+                if topics:
+                    for t in topics:
+                        f.write(f"- {t}\n")
+                else:
+                    f.write("- None captured.\n")
+                f.write("\n")
+            else:
+                f.write("## Summary\n- Conversation captured.\n\n")
+                f.write("## Key Topics\n—\n\n")
+                f.write("## Action Items\n- None captured.\n\n")
+                f.write("## Questions\n- None captured.\n\n")
+                f.write("## Decisions\n- None captured.\n\n")
+            if self.markers:
+                f.write("## Markers\n")
+                for t, label in self.markers:
+                    f.write(f"- {t:0.1f}s: {label}\n")
+                f.write("\n")
+            if self.notes:
+                f.write("## Notes\n")
+                for t, text in self.notes:
+                    f.write(f"- {t:0.1f}s: {text}\n")
+                f.write("\n")
+            f.write("## Full Transcript\n\n")
+            for line in self.transcript_lines:
+                f.write(line + "\n")
+        print(f"[+] Notes saved: {notes_path}")
+
+
+LOG_PATH: Optional[str] = None
+
+
+def _log(msg: str):
+    try:
+        if LOG_PATH:
+            from datetime import datetime as _dt
+            with open(LOG_PATH, 'a', encoding='utf-8') as f:
+                f.write(f"[{_dt.now().isoformat(timespec='seconds')}] {msg}\n")
+    except Exception:
+        pass
+
+
+def gpt_analyze(text: str, api_key: Optional[str], base_url: Optional[str], model: Optional[str], timeout: float = 12.0) -> Optional[str]:
+    if not api_key or not model:
+        return None
+    try:
+        import requests  # type: ignore
+    except Exception:
+        requests = None  # type: ignore
+    url = (base_url.rstrip('/') if base_url else "https://api.openai.com/v1") + "/chat/completions"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    prompt = (
+        "You are a live meeting assistant. Analyze the provided transcript snippet and extract:\n"
+        "- Action Items (owner if clear)\n- Questions\n- Decisions\n- Key Topics (keywords)\n"
+        "Keep it concise and bulleted. If nothing, say 'None.'"
+    )
+    
+    def _post(payload):
+        try:
+            if requests is not None:
+                r = requests.post(url, headers=headers, json=payload, timeout=timeout)
+                return r.status_code, r.text, (r.json() if 'application/json' in r.headers.get('content-type','') else None)
+            else:
+                import urllib.request, urllib.error
+                req = urllib.request.Request(url, data=json.dumps(payload).encode('utf-8'), headers=headers)
+                try:
+                    with urllib.request.urlopen(req, timeout=timeout) as resp:
+                        body = resp.read().decode('utf-8')
+                        try:
+                            j = json.loads(body)
+                        except Exception:
+                            j = None
+                        return 200, body, j
+                except urllib.error.HTTPError as e:
+                    body = e.read().decode('utf-8', errors='ignore')
+                    return e.code, body, None
+        except Exception as e:
+            _log(f'GPT call failed: {e}')
+            return 0, None, None
+
+    base_messages = [
+        {"role": "system", "content": prompt},
+        {"role": "user", "content": text[-6000:]},
+    ]
+    payload = {"model": model, "messages": base_messages, "temperature": 0.2, "max_tokens": 300}
+    status, body, j = _post(payload)
+    _log(f"GPT req status={status}")
+    if status == 400 and body and 'max_tokens' in body and 'max_completion_tokens' in body:
+        _log("Retrying with max_completion_tokens…")
+        payload = {"model": model, "messages": base_messages, "temperature": 0.2, "max_completion_tokens": 300}
+        status, body, j = _post(payload)
+        _log(f"GPT req status={status}")
+    if status != 200 or not j:
+        if body:
+            _log(f"GPT error body: {str(body)[:300]}")
+        return None
+    try:
+        return j.get('choices', [{}])[0].get('message', {}).get('content')
+    except Exception:
+        return None
+
+def gpt_with_prompt(prompt_md: str, user_input: str, api_key: Optional[str], base_url: Optional[str], model: Optional[str], timeout: float = 20.0) -> Optional[str]:
+    if not api_key or not model:
+        return None
+    try:
+        import requests  # type: ignore
+    except Exception:
+        requests = None  # type: ignore
+    url = (base_url.rstrip('/') if base_url else "https://api.openai.com/v1") + "/chat/completions"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    messages = [
+        {"role": "system", "content": prompt_md},
+        {"role": "user", "content": user_input},
+    ]
+    payload = {"model": model, "messages": messages, "temperature": 0.2, "max_tokens": 400}
+    try:
+        if requests is not None:
+            r = requests.post(url, headers=headers, json=payload, timeout=timeout)
+            if r.status_code == 400 and "max_tokens" in r.text and "max_completion_tokens" in r.text:
+                payload["max_completion_tokens"] = payload.pop("max_tokens", 400)
+                r = requests.post(url, headers=headers, json=payload, timeout=timeout)
+            if r.status_code == 200:
+                j = r.json()
+                return j.get('choices', [{}])[0].get('message', {}).get('content')
+            return None
+        else:
+            import urllib.request, urllib.error
+            req = urllib.request.Request(url, data=json.dumps(payload).encode('utf-8'), headers=headers)
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    body = resp.read().decode('utf-8')
+                    try:
+                        j = json.loads(body)
+                    except Exception:
+                        j = None
+                    if j:
+                        return j.get('choices', [{}])[0].get('message', {}).get('content')
+                    return None
+            except urllib.error.HTTPError:
+                return None
+    except Exception:
+        return None
+
+def analyzer_loop(state: SharedState, api_key: Optional[str], base_url: Optional[str], model: Optional[str], stop_event: threading.Event, prompt_md: Optional[str] = None):
+    def parse_blocks(s: str) -> Tuple[List[str], List[str], List[str], List[str]]:
+        actions: List[str] = []
+        questions: List[str] = []
+        decisions: List[str] = []
+        topics: List[str] = []
+        current = None
+        headers = {
+            'action items': 'actions', 'actions': 'actions',
+            'questions': 'questions', 'question': 'questions',
+            'decisions': 'decisions', 'decision': 'decisions',
+            'key topics': 'topics', 'topics': 'topics', 'keywords': 'topics',
+        }
+        for raw in s.splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            low = line.lower().rstrip(':')
+            if low in headers:
+                current = headers[low]
+                continue
+            text = line[2:].strip() if line.startswith(('- ', '* ')) else line
+            if current == 'actions':
+                actions.append(text)
+            elif current == 'questions':
+                questions.append(text)
+            elif current == 'decisions':
+                decisions.append(text)
+            elif current == 'topics':
+                topics.extend([t.strip() for t in text.split(',') if t.strip()]) if ',' in text else topics.append(text)
+        return actions, questions, decisions, topics
+
+    def fallback(snippet: str) -> Tuple[List[str], List[str], List[str], List[str]]:
+        import re
+        actions: List[str] = []
+        questions: List[str] = []
+        decisions: List[str] = []
+        freq = {}
+        for l in [x.strip() for x in snippet.splitlines() if x.strip()]:
+            low = l.lower()
+            if '?' in l or low.startswith((
+                'who ', 'what ', 'why ', 'how ', 'when ', 'where ',
+                'do ', 'does ', 'did ', 'is ', 'are ', 'have ', 'has '
+            )):
+                questions.append(l)
+            if any(k in low for k in (
+                'we decided', 'agreed', 'decision', 'we will', "we'll", 'we chose', 'proceed'
+            )):
+                decisions.append(l)
+            if any(k in low for k in (
+                'we need to', 'we should', 'todo', 'follow up', 'please ', 'can you', 'assign', 'schedule', 'send ', 'prepare '
+            )):
+                actions.append(l)
+            for tok in [t.lower() for t in re.findall(r'[A-Za-z]+', l) if len(t) >= 4]:
+                if tok in SharedState._STOPWORDS:
+                    continue
+                freq[tok] = freq.get(tok, 0) + 1
+        topics = [t for t, _ in sorted(freq.items(), key=lambda kv: (-kv[1], kv[0]))[:10]]
+        return actions[:5], questions[:5], decisions[:5], topics
+
+    while not stop_event.is_set():
+        transcript, _, partial = state.snapshot()
+        snippet = ("\n".join(transcript[-60:]) + ("\n" + partial if partial else "")).strip()
+        if snippet:
+            analysis = None
+            if prompt_md:
+                analysis = gpt_with_prompt(prompt_md, snippet, api_key, base_url, model)
+            if analysis is None:
+                analysis = gpt_analyze(snippet, api_key, base_url, model)
+            if analysis:
+                a, q, d, t = parse_blocks(analysis)
+                state.add_analysis_chunks(a, q, d, t)
+                state.set_analysis(analysis)
+            else:
+                a, q, d, t = fallback(snippet)
+                state.add_analysis_chunks(a, q, d, t)
+        stop_event.wait(5.0)
+
+
+def run_curses_ui(source: str, sink: Optional[str], vosk_label: str, llm_model: Optional[str], state: SharedState, tr: LiveTranscriber, reader_thread: threading.Thread, *, interview_mode: bool = False, interview_prompt: Optional[str] = None, api_key: Optional[str] = None, base_url: Optional[str] = None):
+    def init_colors():
+        if not curses.has_colors():
+            return {}
+        curses.start_color()
+        try:
+            curses.use_default_colors()
+        except Exception:
+            pass
+        # Gruvbox-dark inspired (approximation with basic curses palette)
+        pairs = {
+            'default': 1,   # subtle body text
+            'title': 2,     # high-contrast title bar
+            'sep': 3,       # vertical divider
+            'left': 4,      # transcript
+            'right': 5,     # analysis
+            'partial': 6,   # dimmed partial
+            'footer': 7,    # high-contrast footer
+        }
+        curses.init_pair(pairs['default'], curses.COLOR_WHITE, -1)
+        # Title/Footer as black on yellow for strong contrast
+        curses.init_pair(pairs['title'], curses.COLOR_BLACK, curses.COLOR_YELLOW)
+        curses.init_pair(pairs['footer'], curses.COLOR_BLACK, curses.COLOR_YELLOW)
+        # Separator accent
+        curses.init_pair(pairs['sep'], curses.COLOR_YELLOW, -1)
+        # Bodies
+        curses.init_pair(pairs['left'], curses.COLOR_WHITE, -1)
+        curses.init_pair(pairs['right'], curses.COLOR_CYAN, -1)
+        # Partial: dimmed yellow text on default
+        curses.init_pair(pairs['partial'], curses.COLOR_YELLOW, -1)
+        return pairs
+
+    def wrap_bulleted(lines: List[str], width: int, bullet: str = "- ") -> List[str]:
+        """Wrap lines as bulleted blocks with a blank spacer between blocks."""
+        out: List[str] = []
+        indent = " " * len(bullet)
+        for raw in lines:
+            raw = (raw or "").strip()
+            if raw == "":
+                out.append("")
+                continue
+            first = True
+            wrap_width = max(1, width - len(bullet))
+            wrapped = textwrap.wrap(raw, wrap_width) or [""]
+            for seg in wrapped:
+                if first:
+                    out.append(bullet + seg)
+                    first = False
+                else:
+                    out.append(indent + seg)
+            out.append("")
+        return out
+
+    def _ui(stdscr):
+        curses.curs_set(0)
+        stdscr.nodelay(True)
+        stdscr.timeout(200)
+
+        title = f"Src: {source}  Sink: {sink or '-'}  ASR: {vosk_label}  LLM: {llm_model or '-'}"
+        footer = "q Quit  m Mark  n Note"
+
+        pairs = init_colors()
+
+        note_mode = False
+        note_buffer = ""
+        left_offset = 0
+        # Start at top (no bottom-stick on first render)
+        left_follow = False
+        active_search = ""
+        filter_query = ""
+        capturing = False
+        answering = False
+
+        def prompt_line(prompt_text: str) -> str:
+            h, w = stdscr.getmaxyx()
+            curses.curs_set(1)
+            curses.echo()
+            stdscr.nodelay(False); stdscr.timeout(-1)
+            stdscr.addnstr(h-1, 0, prompt_text[:w], w, curses.A_REVERSE)
+            stdscr.clrtoeol(); stdscr.refresh()
+            try:
+                s = stdscr.getstr(h-1, len(prompt_text), max(1, w - len(prompt_text) - 1))
+                return (s.decode(errors='ignore').strip() if s else "")
+            except Exception:
+                return ""
+            finally:
+                curses.noecho(); curses.curs_set(0)
+                stdscr.nodelay(True); stdscr.timeout(200)
+
+        while not tr.stop_event.is_set():
+            h, w = stdscr.getmaxyx()
+            title_h = 1
+            footer_h = 1
+            body_h = max(1, h - title_h - footer_h)
+            # Keep both panes usable on small terminals
+            min_pane = 10
+            left_w = int(w * 0.58)
+            left_w = max(min_pane, min(w - min_pane, left_w)) if w >= (min_pane * 2) else max(1, w - 1)
+            right_w = max(1, w - left_w)
+
+            stdscr.erase()
+            if pairs:
+                stdscr.addnstr(0, 0, title[:w], w, curses.color_pair(pairs['title']) | curses.A_BOLD)
+            else:
+                stdscr.addnstr(0, 0, title[:w], w, curses.A_REVERSE)
+
+            transcript, analysis, partial = state.snapshot()
+
+            # Left pane: bulleted transcript; last row reserved for partial
+            y = 1
+            reserved_for_partial = 1
+            available_rows = max(0, body_h - reserved_for_partial)
+            bullet_lines = wrap_bulleted(transcript, left_w - 2, bullet="• ")
+            max_offset = max(0, len(bullet_lines) - available_rows)
+            if left_follow:
+                left_offset = max_offset
+            else:
+                left_offset = max(0, min(left_offset, max_offset))
+            view_lines = bullet_lines[left_offset:left_offset + available_rows]
+            for seg in view_lines:
+                if y >= 1 + body_h:
+                    break
+                attr = curses.color_pair(pairs['left']) if pairs else 0
+                if active_search and active_search.lower() in seg.lower():
+                    attr |= curses.A_REVERSE
+                stdscr.addnstr(y, 0, seg[: left_w - 2], left_w - 2, attr)
+                y += 1
+
+            # Partial on the last row of the left pane (single line, prefixed with ellipsis)
+            if body_h >= 1:
+                py = title_h + body_h  # 1-based body area ends at this row index
+                py = min(py, h - footer_h - 1)
+                pdisp = f"… {partial}" if partial else ""
+                pdisp = pdisp[:max(0, left_w - 2)]
+                attr = (curses.color_pair(pairs['partial']) | curses.A_DIM) if (pairs and partial) else (curses.A_DIM if partial else 0)
+                try:
+                    stdscr.addnstr(py, 0, " " * (left_w - 2), left_w - 2)
+                    if pdisp:
+                        stdscr.addnstr(py, 0, pdisp, left_w - 2, attr)
+                except Exception:
+                    pass
+
+            # Vertical separator (with color if available)
+            try:
+                if pairs:
+                    stdscr.attron(curses.color_pair(pairs['sep']))
+                stdscr.vline(1, left_w - 1, curses.ACS_VLINE, body_h)
+                if pairs:
+                    stdscr.attroff(curses.color_pair(pairs['sep']))
+            except Exception:
+                pass
+
+            # Right pane: analysis
+            right_x = left_w
+            ry = 1
+            right_header = None
+            if not tr.has_vosk:
+                right_header = "ASR disabled (recording only)"
+            if interview_mode:
+                status = "capturing" if capturing else ("answering" if answering else "idle")
+                extra = f"Interview mode: {status}"
+                if right_header:
+                    right_header += " · " + extra
+                else:
+                    right_header = extra
+            initial_text = analysis or "Waiting for analysis..."
+            if right_header:
+                for seg in textwrap.wrap(right_header, right_w - 1) or [""]:
+                    if ry >= 1 + body_h:
+                        break
+                    attr = curses.color_pair(pairs['right']) | curses.A_BOLD if pairs else curses.A_BOLD
+                    stdscr.addnstr(ry, right_x, seg, right_w - 1, attr)
+                    ry += 1
+                if ry < 1 + body_h:
+                    ry += 1
+            for line in initial_text.splitlines():
+                for seg in textwrap.wrap(line, right_w - 1) or [""]:
+                    if ry >= 1 + body_h:
+                        break
+                    attr = curses.color_pair(pairs['right']) if pairs else 0
+                    stdscr.addnstr(ry, right_x, seg, right_w - 1, attr)
+                    ry += 1
+
+            # Footer with elapsed time and key hints
+            elapsed = time.strftime('%H:%M:%S', time.gmtime(time.time() - tr.start_time))
+            footer = f"q Quit  m Mark  n Note  / search  \ filter  j/k scroll   t={elapsed}"
+            if note_mode:
+                ft = f"note> {note_buffer}"[: w]
+                if pairs:
+                    stdscr.addnstr(h - 1, 0, ft, w, curses.color_pair(pairs['footer']))
+                else:
+                    stdscr.addnstr(h - 1, 0, ft, w, curses.A_REVERSE)
+            else:
+                if pairs:
+                    stdscr.addnstr(h - 1, 0, footer[:w], w, curses.color_pair(pairs['footer']))
+                else:
+                    stdscr.addnstr(h - 1, 0, footer[:w], w, curses.A_REVERSE)
+
+            stdscr.refresh()
+
+            try:
+                ch = stdscr.getch()
+            except Exception:
+                ch = -1
+
+            if ch == -1:
+                continue
+
+            if note_mode:
+                if ch in (10, 13):  # Enter
+                    if note_buffer.strip():
+                        tr.add_note(note_buffer.strip())
+                    note_mode = False
+                    note_buffer = ""
+                elif ch in (27,):  # ESC
+                    note_mode = False
+                    note_buffer = ""
+                elif ch in (curses.KEY_BACKSPACE, 127, 8):
+                    note_buffer = note_buffer[:-1]
+                elif 32 <= ch <= 126:
+                    note_buffer += chr(ch)
+                continue
+
+            if ch in (ord('q'), ord('Q')):
+                tr.stop_event.set()
+                break
+            elif ch in (ord('m'), ord('M')):
+                tr.add_marker()
+            elif ch in (ord('n'), ord('N')):
+                note_mode = True
+                note_buffer = ""
+            elif interview_mode and ch in (ord('i'), ord('I')):
+                if not capturing:
+                    state.start_segment()
+                    capturing = True
+                else:
+                    question = state.stop_segment()
+                    capturing = False
+                    if question:
+                        answering = True
+                        def _answer():
+                            nonlocal answering
+                            try:
+                                ans = gpt_with_prompt(interview_prompt or "You are an interview assistant.", question, api_key, base_url, llm_model, timeout=30.0)
+                                if ans:
+                                    state.add_qa(question, ans)
+                                else:
+                                    state.add_qa(question, "(No answer returned)")
+                            finally:
+                                answering = False
+                        threading.Thread(target=_answer, daemon=True).start()
+            elif ch == ord('j'):
+                left_follow = False
+                left_offset = min(max(0, len(bullet_lines) - available_rows), left_offset + 1)
+                if left_offset >= max(0, len(bullet_lines) - available_rows):
+                    left_follow = True
+            elif ch == ord('k'):
+                left_follow = False
+                left_offset = max(0, left_offset - 1)
+            elif ch == ord('/'):
+                q = prompt_line('search> ')
+                if q:
+                    active_search = q
+                    ql = q.lower()
+                    idx = next((i for i, txt in enumerate(bullet_lines) if ql in txt.lower()), None)
+                    if idx is not None:
+                        left_follow = False
+                        left_offset = max(0, min(idx, max(0, len(bullet_lines) - available_rows)))
+            elif ch == ord('\\'):
+                q = prompt_line('filter> ')
+                filter_query = q
+                left_follow = True
+
+        tr.stop_event.set()
+
+    try:
+        curses.wrapper(_ui)
+    finally:
+        if tr.proc and tr.proc.poll() is None:
+            try:
+                tr.proc.terminate()
+            except Exception:
+                pass
+        reader_thread.join(timeout=2)
+
+
+def main():
+    print("=== Live Assistant (TUI) ===")
+
+    parser = argparse.ArgumentParser(description="Live Assistant TUI")
+    parser.add_argument("--source", dest="source", help="PulseAudio source name (capture)")
+    parser.add_argument("--sink", dest="sink", help="PulseAudio sink name (playback)")
+    parser.add_argument("--vosk-model-path", dest="vosk_model_path", help="Path to Vosk model directory")
+    parser.add_argument("--llm-model", dest="llm_model", help="LLM model name (e.g., gpt-4o-mini)")
+    parser.add_argument("--openai-base-url", dest="openai_base_url", help="OpenAI-compatible base URL")
+    args, unknown = parser.parse_known_args()
+
+    interactive = sys.stdin.isatty()
+
+    sources = list_pulse_devices("sources")
+    sinks = list_pulse_devices("sinks")
+    if not sources:
+        print("[!] No PulseAudio sources found. Is Pulse running?\n    Try: pactl list short sources")
+        sys.exit(1)
+
+    src = args.source
+    if not src:
+        src = choose_from_list("Select capture source (e.g., a 'monitor' for system audio):", sources) if interactive else None
+    if not src:
+        print("Canceled.")
+        return
+    sink = args.sink
+    if not sink and sinks and interactive:
+        sink = choose_from_list("Select playback sink (optional):", sinks)
+
+    model_path = args.vosk_model_path if args.vosk_model_path else (choose_vosk_model_path() if vosk else None)
+    if vosk and model_path:
+        print(f"[=] Using Vosk model at: {model_path}")
+    else:
+        if not vosk:
+            print("[!] 'vosk' not installed. Live transcription disabled; recording only.")
+        else:
+            print("[=] Proceeding without Vosk ASR (recording only).")
+
+    session_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    session_dir = os.path.expanduser(os.path.join("~", "recordings", f"session_{session_ts}"))
+    os.makedirs(session_dir, exist_ok=True)
+
+    llm_model = args.llm_model or os.environ.get("LLM_MODEL") or os.environ.get("OPENAI_MODEL") or "gpt-4o-mini"
+    api_key = os.environ.get("OPENAI_API_KEY")
+    base_url = args.openai_base_url or os.environ.get("OPENAI_BASE_URL")
+    if not args.llm_model and interactive:
+        try:
+            entered_model = input(f"Enter GPT model to use [{llm_model}]: ").strip()
+        except EOFError:
+            entered_model = ""
+        if entered_model:
+            llm_model = entered_model
+
+    # Optional: choose a summary prompt from prompt library
+    summary_prompt_label = None
+    try:
+        summary_prompt, summary_prompt_label = choose_summary_prompt_info()
+    except Exception:
+        summary_prompt = None
+        summary_prompt_label = None
+
+    if not api_key and interactive:
+        try:
+            entered = input("Enter OPENAI_API_KEY (blank to skip GPT): ").strip()
+        except EOFError:
+            entered = ""
+        if entered:
+            api_key = entered
+            os.environ["OPENAI_API_KEY"] = entered
+
+    global LOG_PATH
+    LOG_PATH = os.path.join(session_dir, "assistant.log")
+    try:
+        with open(LOG_PATH, "w", encoding="utf-8") as f:
+            f.write("Live Assistant log\n")
+    except Exception:
+        LOG_PATH = None
+
+    state = SharedState()
+    tr = LiveTranscriber(src, session_dir, model_path, on_text=state.add_text, on_partial=state.set_partial)
+    reader_thread = tr.run()
+
+    # Determine interview mode
+    interview_mode = bool(summary_prompt_label and 'interview' in summary_prompt_label.lower())
+
+    analyzer_stop = tr.stop_event
+    if not interview_mode:
+        if api_key and llm_model:
+            t_an = threading.Thread(target=analyzer_loop, args=(state, api_key, base_url, llm_model, analyzer_stop, (summary_prompt or None)), daemon=True)
+            t_an.start()
+        else:
+            state.set_analysis("Set OPENAI_API_KEY to enable live analysis.")
+    else:
+        state.set_analysis("Interview mode: press 'i' to capture a question; press 'i' again to stop and generate an answer.")
+
+    vosk_label = tr.engine_label
+    run_curses_ui(src, sink, vosk_label, llm_model if api_key else None, state, tr, reader_thread, interview_mode=interview_mode, interview_prompt=summary_prompt or '', api_key=api_key, base_url=base_url)
+
+    _, final_analysis, _ = state.snapshot()
+    # Full-transcript pass for report
+    try:
+        full_text = "\n".join(tr.transcript_lines)
+    except Exception:
+        full_text = None
+    executive = None
+    if api_key and llm_model and full_text:
+        # Stronger final summary prompt (user-provided template) and larger budget
+        try:
+            import requests  # type: ignore
+            url = (base_url.rstrip('/') if base_url else "https://api.openai.com/v1") + "/chat/completions"
+            headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+            prompt = (
+                "# IDENTITY and PURPOSE\n\n"
+                "You are an AI assistant specialized in analyzing meeting transcripts and extracting key information. "
+                "Your goal is to provide comprehensive yet concise summaries that capture the essential elements of meetings in a structured format.\n\n"
+                "# STEPS\n\n"
+                "- Extract a brief overview of the meeting in 25 words or less, including the purpose and key participants into a section called OVERVIEW.\n\n"
+                "- Extract 10-20 of the most important discussion points from the meeting into a section called KEY POINTS. Focus on core topics, debates, and significant ideas discussed.\n\n"
+                "- Extract all action items and assignments mentioned in the meeting into a section called TASKS. Include responsible parties and deadlines where specified.\n\n"
+                "- Extract 5-10 of the most important decisions made during the meeting into a section called DECISIONS.\n\n"
+                "- Extract any notable challenges, risks, or concerns raised during the meeting into a section called CHALLENGES.\n\n"
+                "- Extract all deadlines, important dates, and milestones mentioned into a section called TIMELINE.\n\n"
+                "- Extract all references to documents, tools, projects, or resources mentioned into a section called REFERENCES.\n\n"
+                "- Extract 5-10 of the most important follow-up items or next steps into a section called NEXT STEPS.\n\n"
+                "# OUTPUT INSTRUCTIONS\n\n"
+                "- Only output Markdown.\n\n"
+                "- Write the KEY POINTS bullets as exactly 16 words.\n\n"
+                "- Write the TASKS bullets as exactly 16 words.\n\n"
+                "- Write the DECISIONS bullets as exactly 16 words.\n\n"
+                "- Write the NEXT STEPS bullets as exactly 16 words.\n\n"
+                "- Use bulleted lists for all sections, not numbered lists.\n\n"
+                "- Do not repeat information across sections.\n\n"
+                "- Do not start items with the same opening words.\n\n"
+                "- If information for a section is not available in the transcript, write \"No information available\".\n\n"
+                "- Do not include warnings or notes; only output the requested sections.\n\n"
+                "- Format each section header in bold using markdown.\n\n"
+                "# INPUT\n\n"
+                "INPUT:"
+            )
+            data = {
+                "model": llm_model,
+                "messages": [
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": full_text[-20000:]},
+                ],
+                "temperature": 0.2,
+                "max_tokens": 800,
+            }
+            r = requests.post(url, headers=headers, json=data, timeout=35)
+            if r.status_code == 400 and "max_tokens" in r.text and "max_completion_tokens" in r.text:
+                data["max_completion_tokens"] = data.pop("max_tokens", 800)
+                r = requests.post(url, headers=headers, json=data, timeout=35)
+            if r.status_code == 200:
+                executive = r.json().get("choices", [{}])[0].get("message", {}).get("content")
+        except Exception:
+            pass
+        if executive and not final_analysis:
+            final_analysis = executive
+    lists = state.get_lists()
+    qas = state.get_qas()
+    tr.write_notes(source_label=src, sink_label=sink, llm_model=(llm_model if api_key else None), analysis_text=final_analysis or None, lists=lists, executive_summary=executive, prompt_label=summary_prompt_label, qas=qas if qas else None)
+
+
+if __name__ == "__main__":
+    main()
