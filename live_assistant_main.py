@@ -13,6 +13,9 @@ from pathlib import Path
 import wave
 import argparse
 
+# Debug/verbose logging toggle
+DEBUG = False
+
 # Optional Vosk import
 try:
     import vosk  # type: ignore
@@ -32,6 +35,7 @@ def list_pulse_devices(kind: str) -> List[Tuple[str, str]]:
         if len(parts) >= 2:
             idx, name = parts[0], parts[1]
             items.append((idx, name))
+    dbg(f"Listed {kind}: {len(items)} items")
     return items
 
 
@@ -45,11 +49,14 @@ def choose_from_list(prompt: str, items: List[Tuple[str, str]]) -> Optional[str]
     while True:
         sel = input("Enter number (or blank to cancel): ").strip()
         if sel == "":
+            dbg("Selection canceled")
             return None
         if sel.isdigit():
             i = int(sel)
             if 0 <= i < len(items):
-                return items[i][1]
+                choice = items[i][1]
+                dbg(f"Selected: {choice}")
+                return choice
         print("Invalid selection; try again.")
 
 
@@ -83,13 +90,17 @@ def choose_vosk_model_path() -> Optional[str]:
     except EOFError:
         sel = ""
     if sel == "":
+        dbg("Vosk model selection skipped (recording only)")
         return None
     if sel.isdigit():
         idx = int(sel)
         if 0 <= idx < len(candidates):
-            return candidates[idx]
+            path = candidates[idx]
+            dbg(f"Vosk model selected: {path}")
+            return path
         return None
     if os.path.isdir(sel):
+        dbg(f"Vosk model selected (custom): {sel}")
         return sel
     print(f"[!] Not a directory: {sel}. Proceeding without live ASR.")
     return None
@@ -365,6 +376,7 @@ class LiveTranscriber:
             except Exception as e:
                 print(f"[!] Failed to init Vosk: {e}")
                 self.has_vosk = False
+        dbg(f"LiveTranscriber init: source={self.source} has_vosk={self.has_vosk} engine={self.engine_label}")
 
     def _open_wave(self):
         wav_path = os.path.join(self.session_dir, "audio.wav")
@@ -373,6 +385,7 @@ class LiveTranscriber:
         wf.setsampwidth(2)
         wf.setframerate(16000)
         self.writer = wf
+        dbg(f"Opened WAV for writing: {wav_path}")
 
     def _spawn_ffmpeg(self):
         cmd = [
@@ -382,6 +395,7 @@ class LiveTranscriber:
             "-f", "s16le", "-"
         ]
         self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        dbg(f"Spawned ffmpeg: {' '.join(cmd)} (pid={self.proc.pid if self.proc else 'n/a'})")
 
     def _sec(self) -> float:
         return time.time() - self.start_time
@@ -400,10 +414,12 @@ class LiveTranscriber:
         self._spawn_ffmpeg()
         if not self.proc or not self.proc.stdout:
             print("[!] Failed to start ffmpeg.")
+            _log("ffmpeg start failed: no proc/stdout")
             return threading.Thread(target=lambda: None)
 
         def reader():
             try:
+                dbg("Reader thread started")
                 while not self.stop_event.is_set():
                     chunk = self.proc.stdout.read(4000)
                     if not chunk:
@@ -417,6 +433,7 @@ class LiveTranscriber:
                                 txt = res.get("text", "").strip()
                                 if txt:
                                     self.transcript_lines.append(txt)
+                                    dbg(f"ASR final line len={len(txt)}")
                                     if self.on_text:
                                         try:
                                             self.on_text(txt)
@@ -436,19 +453,24 @@ class LiveTranscriber:
                                 if self.on_partial is not None:
                                     try:
                                         self.on_partial(ptxt)
+                                        if ptxt:
+                                            dbg(f"ASR partial len={len(ptxt)}")
                                     except Exception:
                                         pass
                         except Exception as e:
                             print(f"[!] ASR error: {e}")
+                            _log(f"ASR error: {e}")
             finally:
                 try:
                     if self.writer:
                         self.writer.close()
+                        dbg("Closed WAV writer")
                 except Exception:
                     pass
 
         t_reader = threading.Thread(target=reader, daemon=True)
         t_reader.start()
+        dbg("Reader thread launched")
         return t_reader
 
     def write_notes(self, source_label: str, sink_label: Optional[str], llm_model: Optional[str], analysis_text: Optional[str], lists: Optional[Tuple[List[str], List[str], List[str], List[str]]] = None, executive_summary: Optional[str] = None, prompt_label: Optional[str] = None, qas: Optional[List[Tuple[str, str]]] = None):
@@ -541,6 +563,13 @@ def _log(msg: str):
                 f.write(f"[{_dt.now().isoformat(timespec='seconds')}] {msg}\n")
     except Exception:
         pass
+
+
+def dbg(msg: str):
+    """Verbose debug logger; active only when DEBUG is True."""
+    if not DEBUG:
+        return
+    _log(f"DEBUG: {msg}")
 
 
 def gpt_analyze(text: str, api_key: Optional[str], base_url: Optional[str], model: Optional[str], timeout: float = 12.0) -> Optional[str]:
@@ -708,6 +737,7 @@ def analyzer_loop(state: SharedState, api_key: Optional[str], base_url: Optional
         transcript, _, partial = state.snapshot()
         snippet = ("\n".join(transcript[-60:]) + ("\n" + partial if partial else "")).strip()
         if snippet:
+            dbg(f"Analyzer tick: snippet_len={len(snippet)} use_prompt={bool(prompt_md)}")
             analysis = None
             if prompt_md:
                 analysis = gpt_with_prompt(prompt_md, snippet, api_key, base_url, model)
@@ -717,9 +747,11 @@ def analyzer_loop(state: SharedState, api_key: Optional[str], base_url: Optional
                 a, q, d, t = parse_blocks(analysis)
                 state.add_analysis_chunks(a, q, d, t)
                 state.set_analysis(analysis)
+                dbg(f"Analyzer updated: a={len(a)} q={len(q)} d={len(d)} t={len(t)}")
             else:
                 a, q, d, t = fallback(snippet)
                 state.add_analysis_chunks(a, q, d, t)
+                dbg(f"Analyzer fallback used: a={len(a)} q={len(q)} d={len(d)} t={len(t)}")
         stop_event.wait(5.0)
 
 
@@ -792,6 +824,7 @@ def run_curses_ui(source: str, sink: Optional[str], vosk_label: str, llm_model: 
         # Start at top (no bottom-stick on first render)
         left_follow = False
         active_search = ""
+        search_idx = -1  # index of last matched bullet line
         filter_query = ""
         capturing = False
         answering = False
@@ -812,6 +845,7 @@ def run_curses_ui(source: str, sink: Optional[str], vosk_label: str, llm_model: 
                 curses.noecho(); curses.curs_set(0)
                 stdscr.nodelay(True); stdscr.timeout(200)
 
+        dbg("TUI started")
         while not tr.stop_event.is_set():
             h, w = stdscr.getmaxyx()
             title_h = 1
@@ -831,10 +865,41 @@ def run_curses_ui(source: str, sink: Optional[str], vosk_label: str, llm_model: 
 
             transcript, analysis, partial = state.snapshot()
 
-            # Left pane: bulleted transcript; last row reserved for partial
+            # Left pane layout:
+            # - Top: live partial stream (word-wrapped) with dim style
+            # - Spacer
+            # - Below: finalized transcript as bulleted, word-wrapped blocks
+
+            def wrap_with_prefix(text: str, width: int, prefix: str = "… ") -> List[str]:
+                if not text:
+                    return []
+                width = max(1, width)
+                body_w = max(1, width - len(prefix))
+                parts = textwrap.wrap(text, body_w) or [""]
+                out = []
+                for i, seg in enumerate(parts):
+                    if i == 0:
+                        out.append(prefix + seg)
+                    else:
+                        out.append(" " * len(prefix) + seg)
+                return out
+
             y = 1
-            reserved_for_partial = 1
-            available_rows = max(0, body_h - reserved_for_partial)
+            # 1) Partial (live stream) at the top
+            partial_lines: List[str] = wrap_with_prefix(partial or "", left_w - 2) if partial else []
+            for pl in partial_lines:
+                if y >= 1 + body_h:
+                    break
+                attr = (curses.color_pair(pairs['partial']) | curses.A_DIM) if pairs else curses.A_DIM
+                stdscr.addnstr(y, 0, pl[: left_w - 2], left_w - 2, attr)
+                y += 1
+
+            # Spacer line between partial and bullets
+            if partial_lines and y < 1 + body_h:
+                y += 1
+
+            # 2) Bulleted finalized transcript below
+            available_rows = max(0, (1 + body_h) - y)
             bullet_lines = wrap_bulleted(transcript, left_w - 2, bullet="• ")
             max_offset = max(0, len(bullet_lines) - available_rows)
             if left_follow:
@@ -850,20 +915,6 @@ def run_curses_ui(source: str, sink: Optional[str], vosk_label: str, llm_model: 
                     attr |= curses.A_REVERSE
                 stdscr.addnstr(y, 0, seg[: left_w - 2], left_w - 2, attr)
                 y += 1
-
-            # Partial on the last row of the left pane (single line, prefixed with ellipsis)
-            if body_h >= 1:
-                py = title_h + body_h  # 1-based body area ends at this row index
-                py = min(py, h - footer_h - 1)
-                pdisp = f"… {partial}" if partial else ""
-                pdisp = pdisp[:max(0, left_w - 2)]
-                attr = (curses.color_pair(pairs['partial']) | curses.A_DIM) if (pairs and partial) else (curses.A_DIM if partial else 0)
-                try:
-                    stdscr.addnstr(py, 0, " " * (left_w - 2), left_w - 2)
-                    if pdisp:
-                        stdscr.addnstr(py, 0, pdisp, left_w - 2, attr)
-                except Exception:
-                    pass
 
             # Vertical separator (with color if available)
             try:
@@ -908,7 +959,7 @@ def run_curses_ui(source: str, sink: Optional[str], vosk_label: str, llm_model: 
 
             # Footer with elapsed time and key hints
             elapsed = time.strftime('%H:%M:%S', time.gmtime(time.time() - tr.start_time))
-            footer = f"q Quit  m Mark  n Note  / search  \ filter  j/k scroll   t={elapsed}"
+            footer = f"q Quit  m Mark  n Note  / search (n/N next/prev)  \ filter  j/k scroll   t={elapsed}"
             if note_mode:
                 ft = f"note> {note_buffer}"[: w]
                 if pairs:
@@ -948,19 +999,56 @@ def run_curses_ui(source: str, sink: Optional[str], vosk_label: str, llm_model: 
 
             if ch in (ord('q'), ord('Q')):
                 tr.stop_event.set()
+                dbg("Key 'q' pressed; exiting UI")
                 break
             elif ch in (ord('m'), ord('M')):
                 tr.add_marker()
+                dbg("Marker added")
             elif ch in (ord('n'), ord('N')):
-                note_mode = True
-                note_buffer = ""
+                if active_search:
+                    # With an active search, 'n'/'N' navigate results
+                    ql = active_search.lower()
+                    total = len(bullet_lines)
+                    if total > 0:
+                        if ch == ord('n'):
+                            start = (search_idx + 1) % total
+                            idx = None
+                            for i in range(total):
+                                j = (start + i) % total
+                                if ql in bullet_lines[j].lower():
+                                    idx = j; break
+                            if idx is not None:
+                                search_idx = idx
+                                left_follow = False
+                                max_offset = max(0, len(bullet_lines) - available_rows)
+                                left_offset = max(0, min(idx, max_offset))
+                                dbg(f"Search next -> {idx}")
+                        else:  # 'N'
+                            start = (search_idx - 1) % total if search_idx != -1 else (total - 1)
+                            idx = None
+                            for i in range(total):
+                                j = (start - i) % total
+                                if ql in bullet_lines[j].lower():
+                                    idx = j; break
+                            if idx is not None:
+                                search_idx = idx
+                                left_follow = False
+                                max_offset = max(0, len(bullet_lines) - available_rows)
+                                left_offset = max(0, min(idx, max_offset))
+                                dbg(f"Search prev -> {idx}")
+                else:
+                    note_mode = True
+                    note_buffer = ""
+                    dbg("Note mode entered")
             elif interview_mode and ch in (ord('i'), ord('I')):
                 if not capturing:
                     state.start_segment()
                     capturing = True
+                    dbg("Interview capture started")
                 else:
                     question = state.stop_segment()
                     capturing = False
+                    dbg(f"Interview capture stopped; q_len={len(question) if question else 0}")
                     if question:
                         answering = True
                         def _answer():
@@ -984,13 +1072,23 @@ def run_curses_ui(source: str, sink: Optional[str], vosk_label: str, llm_model: 
                 left_offset = max(0, left_offset - 1)
             elif ch == ord('/'):
                 q = prompt_line('search> ')
-                if q:
+                if not q:
+                    active_search = ""
+                    search_idx = -1
+                else:
                     active_search = q
                     ql = q.lower()
+                    # find first occurrence
                     idx = next((i for i, txt in enumerate(bullet_lines) if ql in txt.lower()), None)
                     if idx is not None:
+                        search_idx = idx
                         left_follow = False
                         left_offset = max(0, min(idx, max(0, len(bullet_lines) - available_rows)))
+                        dbg(f"Search set '{active_search}', first at {idx}")
+                    else:
+                        search_idx = -1
+                        dbg(f"Search set '{active_search}', no matches")
+            
             elif ch == ord('\\'):
                 q = prompt_line('filter> ')
                 filter_query = q
@@ -1018,9 +1116,14 @@ def main():
     parser.add_argument("--vosk-model-path", dest="vosk_model_path", help="Path to Vosk model directory")
     parser.add_argument("--llm-model", dest="llm_model", help="LLM model name (e.g., gpt-4o-mini)")
     parser.add_argument("--openai-base-url", dest="openai_base_url", help="OpenAI-compatible base URL")
+    parser.add_argument("--debug", dest="debug", action="store_true", help="Enable verbose logging to assistant.log")
     args, unknown = parser.parse_known_args()
 
     interactive = sys.stdin.isatty()
+
+    # Set global debug toggle (log file will be created once session_dir is known)
+    global DEBUG
+    DEBUG = bool(args.debug or os.environ.get('DEBUG'))
 
     sources = list_pulse_devices("sources")
     sinks = list_pulse_devices("sinks")
@@ -1034,18 +1137,25 @@ def main():
     if not src:
         print("Canceled.")
         return
+    else:
+        dbg(f"Using source: {src}")
     sink = args.sink
     if not sink and sinks and interactive:
         sink = choose_from_list("Select playback sink (optional):", sinks)
+        if sink:
+            dbg(f"Using sink: {sink}")
 
     model_path = args.vosk_model_path if args.vosk_model_path else (choose_vosk_model_path() if vosk else None)
     if vosk and model_path:
         print(f"[=] Using Vosk model at: {model_path}")
+        dbg(f"Vosk model path: {model_path}")
     else:
         if not vosk:
             print("[!] 'vosk' not installed. Live transcription disabled; recording only.")
+            dbg("vosk not installed; recording-only mode")
         else:
             print("[=] Proceeding without Vosk ASR (recording only).")
+            dbg("No Vosk model selected; recording-only mode")
 
     session_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     session_dir = os.path.expanduser(os.path.join("~", "recordings", f"session_{session_ts}"))
@@ -1054,6 +1164,7 @@ def main():
     llm_model = args.llm_model or os.environ.get("LLM_MODEL") or os.environ.get("OPENAI_MODEL") or "gpt-4o-mini"
     api_key = os.environ.get("OPENAI_API_KEY")
     base_url = args.openai_base_url or os.environ.get("OPENAI_BASE_URL")
+    dbg(f"LLM config: model={llm_model} api_key_set={bool(api_key)} base_url={'set' if base_url else 'default'}")
     if not args.llm_model and interactive:
         try:
             entered_model = input(f"Enter GPT model to use [{llm_model}]: ").strip()
@@ -1086,6 +1197,12 @@ def main():
             f.write("Live Assistant log\n")
     except Exception:
         LOG_PATH = None
+    if DEBUG:
+        _log("Debug logging enabled")
+        dbg(f"session_dir={session_dir}")
+        dbg(f"interactive={interactive}")
+        dbg(f"argv={sys.argv}")
+        dbg(f"env OPENAI_BASE_URL={os.environ.get('OPENAI_BASE_URL','')} LLM_MODEL={os.environ.get('LLM_MODEL','')} OPENAI_MODEL={os.environ.get('OPENAI_MODEL','')}")
 
     state = SharedState()
     tr = LiveTranscriber(src, session_dir, model_path, on_text=state.add_text, on_partial=state.set_partial)

@@ -57,7 +57,7 @@ Flags override environment and skip interactive prompts. View help: `python3 liv
 - `m` – add a timestamped marker
 - `n` – add a free‑form note (Enter save, Esc cancel, Backspace delete)
 - `j` / `k` – scroll transcript pane
-- `/` – search transcript and jump to first match
+- `/` – search transcript; then `n`/`N` to jump next/prev
 - `\` – filter transcript lines by substring
 - `i` – interview mode: start/stop capturing a question; answer is generated via LLM
 
