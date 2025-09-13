@@ -36,8 +36,15 @@ The app will prompt for capture/playback devices and an optional LLM model. Note
 - `--vosk-model-path` `<dir>` – Vosk model directory (enables live ASR)
 - `--llm-model` `<name>` – model name for analysis (e.g., `gpt-4o-mini`)
 - `--openai-base-url` `<url>` – OpenAI‑compatible API base URL
+- `-C`, `--context` `<path>` – file or directory used as context; repeatable. Supports `.pdf`, `.md`, `.txt`.
 
 Flags override environment and skip interactive prompts. View help: `python3 live_assistant/live_assistant.py --help`.
+
+Context files are loaded at startup and used to ground both the rolling analysis and interview answers. PDFs are extracted via `pdftotext` if available (install `poppler-utils`), otherwise convert to `.txt`/`.md` first.
+
+Examples:
+- `python3 live_assistant/live_assistant.py -C ~/resume.pdf`
+- `python3 live_assistant/live_assistant.py -C ./prev_notes/ -C ./agenda.md`
 
 **Environment Variables**
 - `OPENAI_API_KEY` – enables LLM analysis and executive summary
@@ -46,6 +53,7 @@ Flags override environment and skip interactive prompts. View help: `python3 liv
 - `VOSK_MODEL_PATH` – default Vosk model directory
 - `PROMPT_DIR` – extra directory to scan for prompt `.md` files
 - `SUMMARY_PROMPT` – path to a specific summary prompt `.md`
+- `CONTEXT_PATHS` – colon‑separated list of context paths (files or directories)
 
 **Prompt Library**
 - Prompts are discovered in `prompt_library/` and any directory containing “prompt”.
@@ -68,6 +76,7 @@ Flags override environment and skip interactive prompts. View help: `python3 liv
 
 **Installation Notes**
 - Script‑based: `install_and_run.sh` handles `apt`, `pip`, and Vosk model download.
+- Optional: for PDF context extraction install `pdftotext` (`sudo apt-get install poppler-utils`).
 - Manual pip: `python3 -m pip install --upgrade vosk requests`
 - Vosk models (examples):
   - Small: `~/.cache/vosk-model-small-en-us-0.15`

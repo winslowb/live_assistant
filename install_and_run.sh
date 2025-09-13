@@ -50,7 +50,7 @@ done
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 
 ensure_apt_packages() {
-  local pkgs=(ffmpeg pulseaudio-utils python3 python3-pip unzip wget)
+  local pkgs=(ffmpeg pulseaudio-utils python3 python3-pip unzip wget poppler-utils)
   echo "[+] Installing system packages: ${pkgs[*]}"
   if [[ -n "$SUDO" ]]; then
     $SUDO apt-get update -y

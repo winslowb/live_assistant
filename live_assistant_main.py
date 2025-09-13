@@ -39,6 +39,80 @@ def list_pulse_devices(kind: str) -> List[Tuple[str, str]]:
     return items
 
 
+# ----------------------
+# Context loading helpers
+# ----------------------
+
+ACCEPTED_CONTEXT_EXTS = {'.txt', '.md', '.markdown', '.pdf'}
+
+
+def _read_text_file(p: Path, limit: int = 200_000) -> str:
+    try:
+        txt = p.read_text(encoding='utf-8', errors='ignore')
+        return txt[:limit]
+    except Exception as e:
+        return f"[Could not read text file {p.name}: {e}]"
+
+
+def _read_pdf_file(p: Path, limit: int = 200_000) -> str:
+    # Prefer external 'pdftotext' if available (no extra Python deps)
+    try:
+        import shutil
+        if shutil.which('pdftotext'):
+            # Use layout to preserve lines reasonably; output to stdout
+            proc = subprocess.run(['pdftotext', '-layout', '-q', str(p), '-'], capture_output=True, text=True)
+            if proc.returncode == 0 and proc.stdout:
+                return proc.stdout[:limit]
+            else:
+                return f"[pdftotext failed for {p.name}: rc={proc.returncode}]\n{(proc.stderr or '')[:400]}"
+    except Exception:
+        pass
+    # Fallback minimal message
+    return f"[PDF not extracted; install 'pdftotext' (poppler-utils) or convert {p.name} to .txt/.md]"
+
+
+def collect_context(paths: List[str], max_total: int = 40_000) -> tuple[str, List[str]]:
+    """Load text context from files/dirs. Returns (combined_text, labels)."""
+    seen: set[str] = set()
+    texts: List[str] = []
+    labels: List[str] = []
+    for raw in paths:
+        if not raw:
+            continue
+        try:
+            p = Path(raw).expanduser().resolve()
+        except Exception:
+            continue
+        if not p.exists():
+            continue
+        if p.is_dir():
+            for f in sorted(p.rglob('*')):
+                if f.is_file() and f.suffix.lower() in ACCEPTED_CONTEXT_EXTS:
+                    ap = str(f)
+                    if ap in seen:
+                        continue
+                    seen.add(ap)
+                    txt = _read_pdf_file(f) if f.suffix.lower() == '.pdf' else _read_text_file(f)
+                    if txt:
+                        labels.append(f.name)
+                        texts.append(f"\n\n# {f.name}\n\n" + txt)
+        else:
+            if p.suffix.lower() not in ACCEPTED_CONTEXT_EXTS:
+                continue
+            ap = str(p)
+            if ap in seen:
+                continue
+            seen.add(ap)
+            txt = _read_pdf_file(p) if p.suffix.lower() == '.pdf' else _read_text_file(p)
+            if txt:
+                labels.append(p.name)
+                texts.append(f"\n\n# {p.name}\n\n" + txt)
+    combined = "".join(texts)
+    if len(combined) > max_total:
+        combined = combined[:max_total]
+    return combined.strip(), labels
+
+
 def choose_from_list(prompt: str, items: List[Tuple[str, str]]) -> Optional[str]:
     if not items:
         print("[!] No items available.")
@@ -473,7 +547,7 @@ class LiveTranscriber:
         dbg("Reader thread launched")
         return t_reader
 
-    def write_notes(self, source_label: str, sink_label: Optional[str], llm_model: Optional[str], analysis_text: Optional[str], lists: Optional[Tuple[List[str], List[str], List[str], List[str]]] = None, executive_summary: Optional[str] = None, prompt_label: Optional[str] = None, qas: Optional[List[Tuple[str, str]]] = None):
+    def write_notes(self, source_label: str, sink_label: Optional[str], llm_model: Optional[str], analysis_text: Optional[str], lists: Optional[Tuple[List[str], List[str], List[str], List[str]]] = None, executive_summary: Optional[str] = None, prompt_label: Optional[str] = None, qas: Optional[List[Tuple[str, str]]] = None, context_files: Optional[List[str]] = None):
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         notes_path = os.path.join(self.session_dir, f"notes_{ts}.md")
         duration = time.time() - self.start_time
@@ -488,6 +562,10 @@ class LiveTranscriber:
                 f.write(f"- LLM: `{llm_model}`\n")
             if prompt_label:
                 f.write(f"- Prompt: `{prompt_label}`\n")
+            if context_files:
+                f.write("- Context Files:\n")
+                for nm in context_files:
+                    f.write(f"  - {nm}\n")
             f.write(f"- Duration: `{time.strftime('%H:%M:%S', time.gmtime(duration))}`\n")
             f.write(f"- Generated: `{datetime.now().isoformat(timespec='seconds')}`\n\n")
             if executive_summary:
@@ -572,7 +650,7 @@ def dbg(msg: str):
     _log(f"DEBUG: {msg}")
 
 
-def gpt_analyze(text: str, api_key: Optional[str], base_url: Optional[str], model: Optional[str], timeout: float = 12.0) -> Optional[str]:
+def gpt_analyze(text: str, api_key: Optional[str], base_url: Optional[str], model: Optional[str], timeout: float = 12.0, context: Optional[str] = None) -> Optional[str]:
     if not api_key or not model:
         return None
     try:
@@ -611,9 +689,14 @@ def gpt_analyze(text: str, api_key: Optional[str], base_url: Optional[str], mode
             return 0, None, None
 
     base_messages = [
-        {"role": "system", "content": prompt},
-        {"role": "user", "content": text[-6000:]},
+        {"role": "system", "content": prompt + ("\nUse the provided CONTEXT when relevant to improve precision." if context else "")},
     ]
+    if context:
+        base_messages.append({"role": "system", "content": ("CONTEXT (may be partial):\n" + context[-8000:])})
+    # Also include context once in the user channel to boost grounding on some providers
+    if context:
+        base_messages.append({"role": "user", "content": "Reference context (truncated):\n" + context[-6000:]})
+    base_messages.append({"role": "user", "content": text[-6000:]})
     payload = {"model": model, "messages": base_messages, "temperature": 0.2, "max_tokens": 300}
     status, body, j = _post(payload)
     _log(f"GPT req status={status}")
@@ -631,7 +714,7 @@ def gpt_analyze(text: str, api_key: Optional[str], base_url: Optional[str], mode
     except Exception:
         return None
 
-def gpt_with_prompt(prompt_md: str, user_input: str, api_key: Optional[str], base_url: Optional[str], model: Optional[str], timeout: float = 20.0) -> Optional[str]:
+def gpt_with_prompt(prompt_md: str, user_input: str, api_key: Optional[str], base_url: Optional[str], model: Optional[str], timeout: float = 20.0, context: Optional[str] = None) -> Optional[str]:
     if not api_key or not model:
         return None
     try:
@@ -641,9 +724,12 @@ def gpt_with_prompt(prompt_md: str, user_input: str, api_key: Optional[str], bas
     url = (base_url.rstrip('/') if base_url else "https://api.openai.com/v1") + "/chat/completions"
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     messages = [
-        {"role": "system", "content": prompt_md},
-        {"role": "user", "content": user_input},
+        {"role": "system", "content": prompt_md + ("\nUse the provided CONTEXT to tailor answers." if context else "")},
     ]
+    if context:
+        messages.append({"role": "system", "content": ("CONTEXT (may be partial):\n" + context[-10000:])})
+        messages.append({"role": "user", "content": "Reference context (truncated):\n" + context[-8000:]})
+    messages.append({"role": "user", "content": user_input})
     payload = {"model": model, "messages": messages, "temperature": 0.2, "max_tokens": 400}
     try:
         if requests is not None:
@@ -673,7 +759,7 @@ def gpt_with_prompt(prompt_md: str, user_input: str, api_key: Optional[str], bas
     except Exception:
         return None
 
-def analyzer_loop(state: SharedState, api_key: Optional[str], base_url: Optional[str], model: Optional[str], stop_event: threading.Event, prompt_md: Optional[str] = None):
+def analyzer_loop(state: SharedState, api_key: Optional[str], base_url: Optional[str], model: Optional[str], stop_event: threading.Event, prompt_md: Optional[str] = None, context: Optional[str] = None):
     def parse_blocks(s: str) -> Tuple[List[str], List[str], List[str], List[str]]:
         actions: List[str] = []
         questions: List[str] = []
@@ -740,9 +826,9 @@ def analyzer_loop(state: SharedState, api_key: Optional[str], base_url: Optional
             dbg(f"Analyzer tick: snippet_len={len(snippet)} use_prompt={bool(prompt_md)}")
             analysis = None
             if prompt_md:
-                analysis = gpt_with_prompt(prompt_md, snippet, api_key, base_url, model)
+                analysis = gpt_with_prompt(prompt_md, snippet, api_key, base_url, model, context=context)
             if analysis is None:
-                analysis = gpt_analyze(snippet, api_key, base_url, model)
+                analysis = gpt_analyze(snippet, api_key, base_url, model, context=context)
             if analysis:
                 a, q, d, t = parse_blocks(analysis)
                 state.add_analysis_chunks(a, q, d, t)
@@ -755,7 +841,7 @@ def analyzer_loop(state: SharedState, api_key: Optional[str], base_url: Optional
         stop_event.wait(5.0)
 
 
-def run_curses_ui(source: str, sink: Optional[str], vosk_label: str, llm_model: Optional[str], state: SharedState, tr: LiveTranscriber, reader_thread: threading.Thread, *, interview_mode: bool = False, interview_prompt: Optional[str] = None, api_key: Optional[str] = None, base_url: Optional[str] = None):
+def run_curses_ui(source: str, sink: Optional[str], vosk_label: str, llm_model: Optional[str], state: SharedState, tr: LiveTranscriber, reader_thread: threading.Thread, *, interview_mode: bool = False, interview_prompt: Optional[str] = None, api_key: Optional[str] = None, base_url: Optional[str] = None, context: Optional[str] = None):
     def init_colors():
         if not curses.has_colors():
             return {}
@@ -939,6 +1025,12 @@ def run_curses_ui(source: str, sink: Optional[str], vosk_label: str, llm_model: 
                     right_header += " · " + extra
                 else:
                     right_header = extra
+            if context:
+                extra = "CTX: on"
+                if right_header:
+                    right_header += " · " + extra
+                else:
+                    right_header = extra
             initial_text = analysis or "Waiting for analysis..."
             if right_header:
                 for seg in textwrap.wrap(right_header, right_w - 1) or [""]:
@@ -1054,7 +1146,7 @@ def run_curses_ui(source: str, sink: Optional[str], vosk_label: str, llm_model: 
                         def _answer():
                             nonlocal answering
                             try:
-                                ans = gpt_with_prompt(interview_prompt or "You are an interview assistant.", question, api_key, base_url, llm_model, timeout=30.0)
+                                ans = gpt_with_prompt(interview_prompt or "You are an interview assistant.", question, api_key, base_url, llm_model, timeout=30.0, context=context)
                                 if ans:
                                     state.add_qa(question, ans)
                                 else:
@@ -1116,6 +1208,7 @@ def main():
     parser.add_argument("--vosk-model-path", dest="vosk_model_path", help="Path to Vosk model directory")
     parser.add_argument("--llm-model", dest="llm_model", help="LLM model name (e.g., gpt-4o-mini)")
     parser.add_argument("--openai-base-url", dest="openai_base_url", help="OpenAI-compatible base URL")
+    parser.add_argument("-C", "--context", dest="context", action="append", help="File or directory to use as context (.pdf, .md, .txt). Can repeat.")
     parser.add_argument("--debug", dest="debug", action="store_true", help="Enable verbose logging to assistant.log")
     args, unknown = parser.parse_known_args()
 
@@ -1124,6 +1217,14 @@ def main():
     # Set global debug toggle (log file will be created once session_dir is known)
     global DEBUG
     DEBUG = bool(args.debug or os.environ.get('DEBUG'))
+
+    # Prepare context (from CLI or env var CONTEXT_PATHS=path1:path2,...)
+    context_paths: List[str] = []
+    if args.context:
+        context_paths.extend(args.context)
+    env_ctx = os.environ.get('CONTEXT_PATHS') or os.environ.get('CONTEXT')
+    if env_ctx:
+        context_paths.extend([p for p in env_ctx.split(':') if p])
 
     sources = list_pulse_devices("sources")
     sinks = list_pulse_devices("sinks")
@@ -1204,6 +1305,17 @@ def main():
         dbg(f"argv={sys.argv}")
         dbg(f"env OPENAI_BASE_URL={os.environ.get('OPENAI_BASE_URL','')} LLM_MODEL={os.environ.get('LLM_MODEL','')} OPENAI_MODEL={os.environ.get('OPENAI_MODEL','')}")
 
+    # Load context text (do this after LOG_PATH setup for debug logging)
+    context_text = ""
+    context_labels: List[str] = []
+    if context_paths:
+        try:
+            context_text, context_labels = collect_context(context_paths)
+            if context_text:
+                dbg(f"Loaded context chars={len(context_text)} from files={len(context_labels)}")
+        except Exception as e:
+            _log(f"Context load failed: {e}")
+
     state = SharedState()
     tr = LiveTranscriber(src, session_dir, model_path, on_text=state.add_text, on_partial=state.set_partial)
     reader_thread = tr.run()
@@ -1214,7 +1326,7 @@ def main():
     analyzer_stop = tr.stop_event
     if not interview_mode:
         if api_key and llm_model:
-            t_an = threading.Thread(target=analyzer_loop, args=(state, api_key, base_url, llm_model, analyzer_stop, (summary_prompt or None)), daemon=True)
+            t_an = threading.Thread(target=analyzer_loop, args=(state, api_key, base_url, llm_model, analyzer_stop, (summary_prompt or None), context_text or None), daemon=True)
             t_an.start()
         else:
             state.set_analysis("Set OPENAI_API_KEY to enable live analysis.")
@@ -1222,7 +1334,7 @@ def main():
         state.set_analysis("Interview mode: press 'i' to capture a question; press 'i' again to stop and generate an answer.")
 
     vosk_label = tr.engine_label
-    run_curses_ui(src, sink, vosk_label, llm_model if api_key else None, state, tr, reader_thread, interview_mode=interview_mode, interview_prompt=summary_prompt or '', api_key=api_key, base_url=base_url)
+    run_curses_ui(src, sink, vosk_label, llm_model if api_key else None, state, tr, reader_thread, interview_mode=interview_mode, interview_prompt=summary_prompt or '', api_key=api_key, base_url=base_url, context=context_text or None)
 
     _, final_analysis, _ = state.snapshot()
     # Full-transcript pass for report
@@ -1265,12 +1377,15 @@ def main():
                 "# INPUT\n\n"
                 "INPUT:"
             )
+            messages = [
+                {"role": "system", "content": prompt + ("\nUse CONTEXT if provided to ground references, but do not invent details." if (context_text or None) else "")},
+            ]
+            if context_text:
+                messages.append({"role": "system", "content": ("CONTEXT (may be partial):\n" + context_text[-12000:])})
+            messages.append({"role": "user", "content": full_text[-20000:]})
             data = {
                 "model": llm_model,
-                "messages": [
-                    {"role": "system", "content": prompt},
-                    {"role": "user", "content": full_text[-20000:]},
-                ],
+                "messages": messages,
                 "temperature": 0.2,
                 "max_tokens": 800,
             }
@@ -1286,7 +1401,7 @@ def main():
             final_analysis = executive
     lists = state.get_lists()
     qas = state.get_qas()
-    tr.write_notes(source_label=src, sink_label=sink, llm_model=(llm_model if api_key else None), analysis_text=final_analysis or None, lists=lists, executive_summary=executive, prompt_label=summary_prompt_label, qas=qas if qas else None)
+    tr.write_notes(source_label=src, sink_label=sink, llm_model=(llm_model if api_key else None), analysis_text=final_analysis or None, lists=lists, executive_summary=executive, prompt_label=summary_prompt_label, qas=qas if qas else None, context_files=(context_labels if context_labels else None))
 
 
 if __name__ == "__main__":
