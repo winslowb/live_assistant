@@ -44,6 +44,7 @@ def list_pulse_devices(kind: str) -> List[Tuple[str, str]]:
 # ----------------------
 
 ACCEPTED_CONTEXT_EXTS = {'.txt', '.md', '.markdown', '.pdf'}
+_WARNED_NO_PDFTOTEXT = False
 
 
 def _read_text_file(p: Path, limit: int = 200_000) -> str:
@@ -68,6 +69,14 @@ def _read_pdf_file(p: Path, limit: int = 200_000) -> str:
     except Exception:
         pass
     # Fallback minimal message
+    global _WARNED_NO_PDFTOTEXT
+    if not _WARNED_NO_PDFTOTEXT:
+        try:
+            print("[!] 'pdftotext' not found; PDF context won't be extracted. Install 'poppler-utils' or convert PDFs to .txt/.md.")
+            _log("pdftotext not found; PDF context will not be extracted")
+        except Exception:
+            pass
+        _WARNED_NO_PDFTOTEXT = True
     return f"[PDF not extracted; install 'pdftotext' (poppler-utils) or convert {p.name} to .txt/.md]"
 
 
@@ -841,7 +850,7 @@ def analyzer_loop(state: SharedState, api_key: Optional[str], base_url: Optional
         stop_event.wait(5.0)
 
 
-def run_curses_ui(source: str, sink: Optional[str], vosk_label: str, llm_model: Optional[str], state: SharedState, tr: LiveTranscriber, reader_thread: threading.Thread, *, interview_mode: bool = False, interview_prompt: Optional[str] = None, api_key: Optional[str] = None, base_url: Optional[str] = None, context: Optional[str] = None):
+def run_curses_ui(source: str, sink: Optional[str], vosk_label: str, llm_model: Optional[str], state: SharedState, tr: LiveTranscriber, reader_thread: threading.Thread, *, interview_mode: bool = False, interview_prompt: Optional[str] = None, api_key: Optional[str] = None, base_url: Optional[str] = None, context: Optional[str] = None, context_labels: Optional[List[str]] = None):
     def init_colors():
         if not curses.has_colors():
             return {}
@@ -1026,7 +1035,8 @@ def run_curses_ui(source: str, sink: Optional[str], vosk_label: str, llm_model: 
                 else:
                     right_header = extra
             if context:
-                extra = "CTX: on"
+                # Show number of context files if known
+                extra = f"CTX: {len(context_labels) if context_labels is not None else 'on'}"
                 if right_header:
                     right_header += " · " + extra
                 else:
@@ -1312,7 +1322,10 @@ def main():
         try:
             context_text, context_labels = collect_context(context_paths)
             if context_text:
+                print(f"[=] Loaded context: {len(context_text)} chars from {len(context_labels)} file(s)")
                 dbg(f"Loaded context chars={len(context_text)} from files={len(context_labels)}")
+            else:
+                print("[!] No valid context text loaded from provided -C/CONTEXT_PATHS. Ensure files exist and are .pdf/.md/.txt. For PDFs, install 'pdftotext' (poppler-utils).")
         except Exception as e:
             _log(f"Context load failed: {e}")
 
@@ -1334,7 +1347,7 @@ def main():
         state.set_analysis("Interview mode: press 'i' to capture a question; press 'i' again to stop and generate an answer.")
 
     vosk_label = tr.engine_label
-    run_curses_ui(src, sink, vosk_label, llm_model if api_key else None, state, tr, reader_thread, interview_mode=interview_mode, interview_prompt=summary_prompt or '', api_key=api_key, base_url=base_url, context=context_text or None)
+    run_curses_ui(src, sink, vosk_label, llm_model if api_key else None, state, tr, reader_thread, interview_mode=interview_mode, interview_prompt=summary_prompt or '', api_key=api_key, base_url=base_url, context=context_text or None, context_labels=context_labels or None)
 
     _, final_analysis, _ = state.snapshot()
     # Full-transcript pass for report

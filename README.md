@@ -11,6 +11,7 @@ This folder is the project root. The launcher prefers a local `live_assistant_ma
 - Adds markers and free‑form notes during recording.
 - Supports an “Interview” mode to capture a question, then auto‑answer with an LLM.
 - Writes Markdown notes and an optional executive summary at the end of the session.
+- Can take external pdfs, markdown or other text files for ai context
 
 **Outputs**
 - `~/recordings/session_YYYYmmdd_HHMMSS/`
