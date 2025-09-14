@@ -87,12 +87,6 @@ Examples:
 - After quitting the TUI, a longer summary can be generated if `OPENAI_API_KEY` is set.
 - Uses the full transcript (last slice) with a structured prompt; output is added to the notes file.
 
-**Standalone Mode (decoupled repo)**
-- To fully decouple from the parent repo, copy into this folder:
-  - `../live_assistant_main.py`
-  - `../prompt_library/` (entire folder)
-- The launcher (`live_assistant.py`) prefers the local copy; otherwise it falls back to the parent.
-
 **Troubleshooting**
 - “No PulseAudio sources found” or connection refused:
   - Ensure PulseAudio is running and accessible from your environment.
