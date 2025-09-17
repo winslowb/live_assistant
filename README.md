@@ -10,6 +10,8 @@ This folder is the project root. The launcher prefers a local `live_assistant_ma
 - Streams rolling analysis on the right: actions, questions, decisions, and topics.
 - Adds markers and free‑form notes during recording.
 - Supports an “Interview” mode to capture a question, then auto‑answer with an LLM.
+- Offers an interactive chatbot so you can query the meeting in real time.
+- Lets you mount extra context files or URLs on the fly while the session runs.
 - Writes Markdown notes and an optional executive summary at the end of the session.
 - Can take external pdfs, markdown or other text files for ai context
 
@@ -43,6 +45,8 @@ Flags override environment and skip interactive prompts. View help: `python3 liv
 
 Context files are loaded at startup and used to ground both the rolling analysis and interview answers. PDFs are extracted via `pdftotext` if available (install `poppler-utils`), otherwise convert to `.txt`/`.md` first.
 
+Need more context mid-meeting? Press `C` in the TUI to add another `.pdf`/`.md`/`.txt` resource or an `http(s)` URL without stopping the recording.
+
 Examples:
 - `python3 live_assistant/live_assistant.py -C ~/resume.pdf`
 - `python3 live_assistant/live_assistant.py -C ./prev_notes/ -C ./agenda.md`
@@ -54,12 +58,14 @@ Examples:
 - `VOSK_MODEL_PATH` – default Vosk model directory
 - `PROMPT_DIR` – extra directory to scan for prompt `.md` files
 - `SUMMARY_PROMPT` – path to a specific summary prompt `.md`
+- `CHAT_PROMPT` – path to a chatbot system prompt `.md`
 - `CONTEXT_PATHS` – colon‑separated list of context paths (files or directories)
 
 **Prompt Library**
 - Prompts are discovered in `prompt_library/` and any directory containing “prompt”.
 - At startup, you can pick a summary/analysis template. Setting `SUMMARY_PROMPT` bypasses the picker.
 - Choosing an “interview” prompt enables interview mode (see Shortcuts).
+- The chatbot uses `prompt_library/chatbot/system.md` by default; override with `CHAT_PROMPT`.
 
 **Shortcuts (TUI)**
 - `q` – quit
@@ -69,6 +75,10 @@ Examples:
 - `/` – search transcript; then `n`/`N` to jump next/prev
 - `\` – filter transcript lines by substring
 - `i` – interview mode: start/stop capturing a question; answer is generated via LLM
+- `c` – ask the chatbot a question grounded in the recent transcript and context
+- `C` – add a context file or URL for immediate use by analysis/chatbot
+- `Tab` – switch focus between transcript and analysis/chat panes
+- `Esc` – dismiss sticky alerts and return focus to the transcript pane
 
 **Audio Devices (PulseAudio)**
 - List sources: `pactl list short sources`
@@ -95,4 +105,3 @@ Examples:
   - Verify `vosk` is installed and `--vosk-model-path` points to a valid model dir.
 - TUI fails to draw in non‑interactive environments:
   - Run from a real terminal; pass flags to skip interactive prompts when needed.
-

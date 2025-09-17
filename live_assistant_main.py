@@ -4,14 +4,20 @@ import sys
 import time
 import json
 import threading
+import queue
 import subprocess
 from datetime import datetime
 import curses
 import textwrap
-from typing import Optional, List, Tuple
+import re
+from typing import Optional, List, Tuple, Dict
 from pathlib import Path
 import wave
 import argparse
+from html import unescape
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
+import urllib.error
 
 # Debug/verbose logging toggle
 DEBUG = False
@@ -45,6 +51,72 @@ def list_pulse_devices(kind: str) -> List[Tuple[str, str]]:
 
 ACCEPTED_CONTEXT_EXTS = {'.txt', '.md', '.markdown', '.pdf'}
 _WARNED_NO_PDFTOTEXT = False
+_CONTEXT_FALLBACK_BULLET = "- No information available; meeting dialogue lacked references to provided external context sources or citations currently recorded."
+
+
+def canonical_context_id(raw: str) -> Optional[str]:
+    candidate = (raw or '').strip()
+    if not candidate:
+        return None
+    parsed = urlparse(candidate)
+    if parsed.scheme in {'http', 'https'}:
+        return candidate
+    try:
+        p = Path(candidate).expanduser().resolve()
+        return str(p)
+    except Exception:
+        return candidate
+
+
+def _label_for_url(url: str) -> str:
+    parsed = urlparse(url)
+    host = parsed.netloc or url
+    path = parsed.path.rstrip('/')
+    label = host + (path if path else '')
+    label = label or url
+    if len(label) > 80:
+        return label[:77] + '...'
+    return label
+
+
+def _html_to_text(html: str) -> str:
+    """Best-effort HTML → plain text conversion without extra deps."""
+    cleaned = re.sub(r'(?is)<(script|style).*?>.*?</\1>', ' ', html)
+    cleaned = re.sub(r'(?is)<head.*?>.*?</head>', ' ', cleaned)
+    cleaned = re.sub(r'(?is)</?(br|p|div|li|tr|table|h[1-6]|section|article)[^>]*>', '\n', cleaned)
+    cleaned = re.sub(r'<[^>]+>', ' ', cleaned)
+    text = unescape(cleaned)
+    text = re.sub(r'\r', '\n', text)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    text = re.sub(r'[ \t]{2,}', ' ', text)
+    return text.strip()
+
+
+def _read_url(url: str, limit: int = 200_000, timeout: float = 12.0) -> str:
+    try:
+        req = Request(url, headers={"User-Agent": "live-assistant-context/0.1"})
+        with urlopen(req, timeout=timeout) as resp:
+            content_type = (resp.headers.get('Content-Type') or '').lower()
+            charset = resp.headers.get_content_charset() or 'utf-8'
+            raw = resp.read(limit + 4096)
+            if len(raw) > limit:
+                raw = raw[:limit]
+            text = raw.decode(charset, errors='ignore')
+            if 'html' in content_type or ('text' in content_type and '<' in text and '>' in text):
+                text = _html_to_text(text)
+            elif 'text' not in content_type and content_type:
+                return f"[Unsupported content type for {url}: {content_type}]"
+            return text[:limit]
+    except urllib.error.HTTPError as e:
+        body = ''
+        try:
+            body = e.read().decode('utf-8', errors='ignore')
+        except Exception:
+            pass
+        msg = body[:200] if body else str(e)
+        return f"[HTTP error for {url}: {msg}]"
+    except Exception as e:
+        return f"[Could not fetch {url}: {e}]"
 
 
 def _read_text_file(p: Path, limit: int = 200_000) -> str:
@@ -87,6 +159,17 @@ def collect_context(paths: List[str], max_total: int = 40_000) -> tuple[str, Lis
     labels: List[str] = []
     for raw in paths:
         if not raw:
+            continue
+        parsed = urlparse(raw)
+        if parsed.scheme in {'http', 'https'}:
+            if raw in seen:
+                continue
+            seen.add(raw)
+            txt = _read_url(raw)
+            if txt:
+                label = _label_for_url(raw)
+                labels.append(label)
+                texts.append(f"\n\n# {label}\n\n" + txt)
             continue
         try:
             p = Path(raw).expanduser().resolve()
@@ -319,6 +402,37 @@ def choose_summary_prompt_info() -> tuple[str|None,str|None]:
     return None, None
 
 
+DEFAULT_CHAT_PROMPT = (
+    "You are a real-time meeting copilot.\n"
+    "Answer the facilitator's questions using the latest transcript excerpt.\n"
+    "If unsure, say you don't know. Cite speakers when possible."
+)
+
+
+def load_chat_prompt() -> tuple[str, str]:
+    """Return (prompt_markdown, label) for the chatbot system prompt."""
+    env_path = os.environ.get('CHAT_PROMPT')
+    if env_path:
+        p = Path(env_path).expanduser()
+        if p.is_file():
+            try:
+                return p.read_text(encoding='utf-8'), str(p)
+            except Exception as e:
+                print(f"[!] Failed to read CHAT_PROMPT at {p}: {e}")
+    here = Path(__file__).resolve().parent
+    candidates = [
+        here / 'prompt_library' / 'chatbot.md',
+        here / 'prompt_library' / 'chatbot' / 'system.md',
+    ]
+    for path in candidates:
+        if path.is_file():
+            try:
+                return path.read_text(encoding='utf-8'), str(path)
+            except Exception:
+                pass
+    return DEFAULT_CHAT_PROMPT, 'builtin.chatbot'
+
+
 class SharedState:
     def __init__(self):
         self.lock = threading.Lock()
@@ -339,6 +453,16 @@ class SharedState:
         self.segment_lines: List[str] = []
         self.segment_partial: str = ''
         self.qas: List[Tuple[str, str]] = []  # (question, answer)
+
+        # Context bundle (mutable via runtime additions)
+        self.context_text = ''
+        self.context_labels: List[str] = []
+        self._context_label_set: set[str] = set()
+        self._context_entries: set[str] = set()
+
+        # Chatbot exchanges (id, question, answer or None while pending)
+        self._chat_history: List[Dict[str, object]] = []
+        self._chat_seq = 0
 
     _STOPWORDS = set('a an and are as at be been being but by for from had has have how i if in into is it its of on or our over so than that the their them then there these they this to under up was we what when where which who will with you your'.split())
 
@@ -392,6 +516,86 @@ class SharedState:
     def get_qas(self) -> List[Tuple[str, str]]:
         with self.lock:
             return list(self.qas)
+
+    # Context helpers
+    def set_context_bundle(self, text: str, labels: List[str], entries: List[str]):
+        with self.lock:
+            self.context_text = text.strip()
+            self.context_labels = []
+            self._context_label_set = set()
+            for label in labels:
+                clean = (label or '').strip()
+                if clean and clean not in self._context_label_set:
+                    self._context_label_set.add(clean)
+                    self.context_labels.append(clean)
+            self._context_entries = {e for e in entries if e}
+
+    def append_context_bundle(self, entry_id: str, text: str, labels: List[str]) -> bool:
+        entry = (entry_id or '').strip()
+        if not entry:
+            return False
+        added = False
+        with self.lock:
+            if entry in self._context_entries:
+                return False
+            chunk = (text or '').strip()
+            if chunk:
+                if self.context_text:
+                    self.context_text += "\n\n"
+                self.context_text += chunk
+                added = True
+            for label in labels:
+                clean = (label or '').strip()
+                if clean and clean not in self._context_label_set:
+                    self._context_label_set.add(clean)
+                    self.context_labels.append(clean)
+                    added = True
+            if added:
+                self._context_entries.add(entry)
+            return added
+
+    def has_context_entry(self, entry_id: str) -> bool:
+        with self.lock:
+            return entry_id in self._context_entries
+
+    def get_context(self) -> Tuple[str, List[str]]:
+        with self.lock:
+            return self.context_text, list(self.context_labels)
+
+    # Chatbot helpers
+    def add_chat_question(self, question: str) -> int:
+        q = (question or "").strip()
+        if not q:
+            return -1
+        with self.lock:
+            cid = self._chat_seq
+            self._chat_seq += 1
+            self._chat_history.append({"id": cid, "question": q, "answer": None, "ts": time.time()})
+            return cid
+
+    def set_chat_answer(self, chat_id: int, answer: Optional[str]):
+        with self.lock:
+            for entry in reversed(self._chat_history):
+                if entry.get("id") == chat_id:
+                    entry["answer"] = (answer.strip() if answer else "")
+                    if answer:
+                        self.analysis = answer.strip()
+                    break
+
+    def get_chat_history(self) -> List[Tuple[str, Optional[str], bool]]:
+        """Returns (question, answer, pending) tuples."""
+        with self.lock:
+            out: List[Tuple[str, Optional[str], bool]] = []
+            for entry in self._chat_history:
+                question = str(entry.get("question", ""))
+                answer = entry.get("answer")
+                pending = answer is None
+                out.append((question, answer if not pending else None, pending))
+            return out
+
+    def has_pending_chat(self) -> bool:
+        with self.lock:
+            return any(entry.get("answer") is None for entry in self._chat_history)
 
     def _add_unique(self, lst, seen, items):
         for it in items:
@@ -556,7 +760,7 @@ class LiveTranscriber:
         dbg("Reader thread launched")
         return t_reader
 
-    def write_notes(self, source_label: str, sink_label: Optional[str], llm_model: Optional[str], analysis_text: Optional[str], lists: Optional[Tuple[List[str], List[str], List[str], List[str]]] = None, executive_summary: Optional[str] = None, prompt_label: Optional[str] = None, qas: Optional[List[Tuple[str, str]]] = None, context_files: Optional[List[str]] = None):
+    def write_notes(self, source_label: str, sink_label: Optional[str], llm_model: Optional[str], analysis_text: Optional[str], lists: Optional[Tuple[List[str], List[str], List[str], List[str]]] = None, executive_summary: Optional[str] = None, prompt_label: Optional[str] = None, qas: Optional[List[Tuple[str, str]]] = None, chats: Optional[List[Tuple[str, str]]] = None, context_files: Optional[List[str]] = None):
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         notes_path = os.path.join(self.session_dir, f"notes_{ts}.md")
         duration = time.time() - self.start_time
@@ -589,6 +793,12 @@ class LiveTranscriber:
                 for i, (q, a) in enumerate(qas, start=1):
                     f.write(f"\n**Q{i}.** {q}\n\n")
                     f.write(f"{a}\n")
+                f.write("\n")
+            if chats:
+                f.write("## Live Chatbot Exchanges\n")
+                for i, (q, a) in enumerate(chats, start=1):
+                    f.write(f"\n**You {i}.** {q}\n\n")
+                    f.write(f"**Assistant.** {a}\n")
                 f.write("\n")
             if lists:
                 actions, questions, decisions, topics = lists
@@ -659,7 +869,7 @@ def dbg(msg: str):
     _log(f"DEBUG: {msg}")
 
 
-def gpt_analyze(text: str, api_key: Optional[str], base_url: Optional[str], model: Optional[str], timeout: float = 12.0, context: Optional[str] = None) -> Optional[str]:
+def gpt_analyze(text: str, api_key: Optional[str], base_url: Optional[str], model: Optional[str], timeout: float = 12.0, context: Optional[str] = None, context_labels: Optional[List[str]] = None) -> Optional[str]:
     if not api_key or not model:
         return None
     try:
@@ -700,20 +910,38 @@ def gpt_analyze(text: str, api_key: Optional[str], base_url: Optional[str], mode
     base_messages = [
         {"role": "system", "content": prompt + ("\nUse the provided CONTEXT when relevant to improve precision." if context else "")},
     ]
+    if context_labels:
+        sources = "\n".join(f"- {lbl}" for lbl in context_labels[:8])
+        base_messages.append({"role": "system", "content": "CONTEXT SOURCES:\n" + sources})
     if context:
         base_messages.append({"role": "system", "content": ("CONTEXT (may be partial):\n" + context[-8000:])})
     # Also include context once in the user channel to boost grounding on some providers
     if context:
         base_messages.append({"role": "user", "content": "Reference context (truncated):\n" + context[-6000:]})
     base_messages.append({"role": "user", "content": text[-6000:]})
-    payload = {"model": model, "messages": base_messages, "temperature": 0.2, "max_tokens": 300}
+    payload: Dict[str, object] = {"model": model, "messages": base_messages, "temperature": 0.2, "max_tokens": 300}
+
+    def _maybe_retry(payload_dict: Dict[str, object], status_code: int, response_body: Optional[str], response_json: Optional[dict]) -> tuple[int, Optional[str], Optional[dict], Dict[str, object]]:
+        nonlocal payload
+        status_local, body_local, json_local = status_code, response_body, response_json
+        if status_local == 400 and body_local and 'max_tokens' in body_local and 'max_completion_tokens' in body_local and 'max_completion_tokens' not in payload_dict:
+            _log("Retrying with max_completion_tokens…")
+            payload_dict = dict(payload_dict)
+            payload_dict.pop('max_tokens', None)
+            payload_dict['max_completion_tokens'] = 300
+            status_local, body_local, json_local = _post(payload_dict)
+            _log(f"GPT req status={status_local}")
+        if status_local == 400 and body_local and '"param": "temperature"' in body_local and 'temperature' in payload_dict:
+            _log("Retrying without temperature…")
+            payload_dict = dict(payload_dict)
+            payload_dict.pop('temperature', None)
+            status_local, body_local, json_local = _post(payload_dict)
+            _log(f"GPT req status={status_local}")
+        return status_local, body_local, json_local, payload_dict
+
     status, body, j = _post(payload)
     _log(f"GPT req status={status}")
-    if status == 400 and body and 'max_tokens' in body and 'max_completion_tokens' in body:
-        _log("Retrying with max_completion_tokens…")
-        payload = {"model": model, "messages": base_messages, "temperature": 0.2, "max_completion_tokens": 300}
-        status, body, j = _post(payload)
-        _log(f"GPT req status={status}")
+    status, body, j, payload = _maybe_retry(payload, status, body, j)
     if status != 200 or not j:
         if body:
             _log(f"GPT error body: {str(body)[:300]}")
@@ -723,7 +951,7 @@ def gpt_analyze(text: str, api_key: Optional[str], base_url: Optional[str], mode
     except Exception:
         return None
 
-def gpt_with_prompt(prompt_md: str, user_input: str, api_key: Optional[str], base_url: Optional[str], model: Optional[str], timeout: float = 20.0, context: Optional[str] = None) -> Optional[str]:
+def gpt_with_prompt(prompt_md: str, user_input: str, api_key: Optional[str], base_url: Optional[str], model: Optional[str], timeout: float = 20.0, context: Optional[str] = None, context_labels: Optional[List[str]] = None) -> Optional[str]:
     if not api_key or not model:
         return None
     try:
@@ -735,27 +963,49 @@ def gpt_with_prompt(prompt_md: str, user_input: str, api_key: Optional[str], bas
     messages = [
         {"role": "system", "content": prompt_md + ("\nUse the provided CONTEXT to tailor answers." if context else "")},
     ]
+    if context_labels:
+        sources = "\n".join(f"- {lbl}" for lbl in context_labels[:8])
+        messages.append({"role": "system", "content": "CONTEXT SOURCES:\n" + sources})
     if context:
         messages.append({"role": "system", "content": ("CONTEXT (may be partial):\n" + context[-10000:])})
         messages.append({"role": "user", "content": "Reference context (truncated):\n" + context[-8000:]})
     messages.append({"role": "user", "content": user_input})
-    payload = {"model": model, "messages": messages, "temperature": 0.2, "max_tokens": 400}
+    payload: Dict[str, object] = {"model": model, "messages": messages, "temperature": 0.2, "max_tokens": 400}
     try:
         if requests is not None:
-            r = requests.post(url, headers=headers, json=payload, timeout=timeout)
-            if r.status_code == 400 and "max_tokens" in r.text and "max_completion_tokens" in r.text:
-                payload["max_completion_tokens"] = payload.pop("max_tokens", 400)
+            attempt = 0
+            while True:
                 r = requests.post(url, headers=headers, json=payload, timeout=timeout)
-            if r.status_code == 200:
-                j = r.json()
-                return j.get('choices', [{}])[0].get('message', {}).get('content')
-            return None
+                if r.status_code == 200:
+                    j = r.json()
+                    return j.get('choices', [{}])[0].get('message', {}).get('content')
+                if r.status_code == 400 and "max_tokens" in r.text and "max_completion_tokens" in r.text and 'max_completion_tokens' not in payload:
+                    payload["max_completion_tokens"] = payload.pop("max_tokens", 400)
+                    attempt += 1
+                    if attempt < 3:
+                        continue
+                if r.status_code == 400 and '"param": "temperature"' in r.text and 'temperature' in payload:
+                    payload.pop("temperature", None)
+                    attempt += 1
+                    if attempt < 3:
+                        continue
+                return None
         else:
             import urllib.request, urllib.error
-            req = urllib.request.Request(url, data=json.dumps(payload).encode('utf-8'), headers=headers)
-            try:
-                with urllib.request.urlopen(req, timeout=timeout) as resp:
-                    body = resp.read().decode('utf-8')
+            def _do_request(data_dict: Dict[str, object]) -> tuple[int, str]:
+                req = urllib.request.Request(url, data=json.dumps(data_dict).encode('utf-8'), headers=headers)
+                try:
+                    with urllib.request.urlopen(req, timeout=timeout) as resp:
+                        body = resp.read().decode('utf-8')
+                        return 200, body
+                except urllib.error.HTTPError as e:
+                    body = e.read().decode('utf-8', errors='ignore')
+                    return e.code, body
+
+            attempt = 0
+            while True:
+                status, body = _do_request(payload)
+                if status == 200:
                     try:
                         j = json.loads(body)
                     except Exception:
@@ -763,12 +1013,128 @@ def gpt_with_prompt(prompt_md: str, user_input: str, api_key: Optional[str], bas
                     if j:
                         return j.get('choices', [{}])[0].get('message', {}).get('content')
                     return None
-            except urllib.error.HTTPError:
+                if status == 400 and "max_tokens" in body and "max_completion_tokens" in body and 'max_completion_tokens' not in payload:
+                    payload["max_completion_tokens"] = payload.pop("max_tokens", 400)
+                    attempt += 1
+                    if attempt < 3:
+                        continue
+                if status == 400 and '"param": "temperature"' in body and 'temperature' in payload:
+                    payload.pop("temperature", None)
+                    attempt += 1
+                    if attempt < 3:
+                        continue
                 return None
     except Exception:
         return None
 
-def analyzer_loop(state: SharedState, api_key: Optional[str], base_url: Optional[str], model: Optional[str], stop_event: threading.Event, prompt_md: Optional[str] = None, context: Optional[str] = None):
+
+def gpt_chat_response(prompt_md: str, question: str, transcript_lines: List[str], chat_history: List[Tuple[str, Optional[str], bool]], api_key: Optional[str], base_url: Optional[str], model: Optional[str], timeout: float = 25.0, context: Optional[str] = None, context_labels: Optional[List[str]] = None) -> Optional[str]:
+    if not api_key or not model:
+        return None
+    try:
+        import requests  # type: ignore
+    except Exception:
+        requests = None  # type: ignore
+
+    url = (base_url.rstrip('/') if base_url else "https://api.openai.com/v1") + "/chat/completions"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+
+    system_prompt = prompt_md.strip() if prompt_md else "You are a real-time meeting copilot."
+    system_prompt += "\nUse the latest transcript excerpts and context sources to keep answers grounded."
+
+    messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
+    if context_labels:
+        sources = "\n".join(f"- {lbl}" for lbl in context_labels[:8])
+        messages.append({"role": "system", "content": "CONTEXT SOURCES:\n" + sources})
+    if context:
+        messages.append({"role": "system", "content": "CONTEXT (truncated):\n" + context[-12000:]})
+
+    if transcript_lines:
+        snippet_lines = transcript_lines[-80:]
+        if snippet_lines:
+            snippet = "\n".join(snippet_lines)
+            if len(snippet) > 6000:
+                snippet = snippet[-6000:]
+            messages.append({"role": "system", "content": "RECENT TRANSCRIPT:\n" + snippet})
+
+    history_tail = chat_history[-6:]
+    for q_prev, a_prev, pending in history_tail:
+        if pending:
+            continue
+        if q_prev:
+            messages.append({"role": "user", "content": q_prev})
+        if a_prev:
+            messages.append({"role": "assistant", "content": a_prev})
+
+    messages.append({"role": "user", "content": question})
+    payload: Dict[str, object] = {
+        "model": model,
+        "messages": messages,
+        "temperature": 0.2,
+        "max_tokens": 500,
+    }
+
+    try:
+        if requests is not None:
+            attempt = 0
+            while True:
+                r = requests.post(url, headers=headers, json=payload, timeout=timeout)
+                if r.status_code == 200:
+                    j = r.json()
+                    return j.get('choices', [{}])[0].get('message', {}).get('content')
+                if r.status_code == 400 and "max_tokens" in r.text and "max_completion_tokens" in r.text and 'max_completion_tokens' not in payload:
+                    payload["max_completion_tokens"] = payload.pop("max_tokens", 500)
+                    attempt += 1
+                    if attempt < 3:
+                        continue
+                if r.status_code == 400 and '"param": "temperature"' in r.text and 'temperature' in payload:
+                    _log("Chatbot retrying without temperature")
+                    payload.pop("temperature", None)
+                    attempt += 1
+                    if attempt < 3:
+                        continue
+                _log(f"Chatbot request failed: status={r.status_code} body={r.text[:200]}")
+                return None
+        else:
+            import urllib.request, urllib.error
+            def _do_request(data_dict: Dict[str, object]) -> tuple[int, str]:
+                req = urllib.request.Request(url, data=json.dumps(data_dict).encode('utf-8'), headers=headers)
+                try:
+                    with urllib.request.urlopen(req, timeout=timeout) as resp:
+                        body = resp.read().decode('utf-8')
+                        return 200, body
+                except urllib.error.HTTPError as e:
+                    body = e.read().decode('utf-8', errors='ignore')
+                    return e.code, body
+
+            attempt = 0
+            while True:
+                status, body = _do_request(payload)
+                if status == 200:
+                    try:
+                        j = json.loads(body)
+                    except Exception:
+                        j = None
+                    if j:
+                        return j.get('choices', [{}])[0].get('message', {}).get('content')
+                    return None
+                if status == 400 and "max_tokens" in body and "max_completion_tokens" in body and 'max_completion_tokens' not in payload:
+                    payload["max_completion_tokens"] = payload.pop("max_tokens", 500)
+                    attempt += 1
+                    if attempt < 3:
+                        continue
+                if status == 400 and '"param": "temperature"' in body and 'temperature' in payload:
+                    payload.pop("temperature", None)
+                    attempt += 1
+                    if attempt < 3:
+                        continue
+                _log(f"Chatbot HTTPError body: {body[:200]}")
+                return None
+    except Exception as e:
+        _log(f"Chatbot call exception: {e}")
+        return None
+
+def analyzer_loop(state: SharedState, api_key: Optional[str], base_url: Optional[str], model: Optional[str], stop_event: threading.Event, prompt_md: Optional[str] = None):
     def parse_blocks(s: str) -> Tuple[List[str], List[str], List[str], List[str]]:
         actions: List[str] = []
         questions: List[str] = []
@@ -834,10 +1200,13 @@ def analyzer_loop(state: SharedState, api_key: Optional[str], base_url: Optional
         if snippet:
             dbg(f"Analyzer tick: snippet_len={len(snippet)} use_prompt={bool(prompt_md)}")
             analysis = None
+            ctx_text, ctx_labels = state.get_context()
+            ctx_text = ctx_text or None
+            ctx_labels = ctx_labels or None
             if prompt_md:
-                analysis = gpt_with_prompt(prompt_md, snippet, api_key, base_url, model, context=context)
+                analysis = gpt_with_prompt(prompt_md, snippet, api_key, base_url, model, context=ctx_text, context_labels=ctx_labels)
             if analysis is None:
-                analysis = gpt_analyze(snippet, api_key, base_url, model, context=context)
+                analysis = gpt_analyze(snippet, api_key, base_url, model, context=ctx_text, context_labels=ctx_labels)
             if analysis:
                 a, q, d, t = parse_blocks(analysis)
                 state.add_analysis_chunks(a, q, d, t)
@@ -850,7 +1219,7 @@ def analyzer_loop(state: SharedState, api_key: Optional[str], base_url: Optional
         stop_event.wait(5.0)
 
 
-def run_curses_ui(source: str, sink: Optional[str], vosk_label: str, llm_model: Optional[str], state: SharedState, tr: LiveTranscriber, reader_thread: threading.Thread, *, interview_mode: bool = False, interview_prompt: Optional[str] = None, api_key: Optional[str] = None, base_url: Optional[str] = None, context: Optional[str] = None, context_labels: Optional[List[str]] = None):
+def run_curses_ui(source: str, sink: Optional[str], vosk_label: str, llm_model: Optional[str], state: SharedState, tr: LiveTranscriber, reader_thread: threading.Thread, *, interview_mode: bool = False, interview_prompt: Optional[str] = None, api_key: Optional[str] = None, base_url: Optional[str] = None, chat_prompt: Optional[str] = None, chat_prompt_label: Optional[str] = None):
     def init_colors():
         if not curses.has_colors():
             return {}
@@ -882,25 +1251,66 @@ def run_curses_ui(source: str, sink: Optional[str], vosk_label: str, llm_model: 
         curses.init_pair(pairs['partial'], curses.COLOR_YELLOW, -1)
         return pairs
 
-    def wrap_bulleted(lines: List[str], width: int, bullet: str = "- ") -> List[str]:
-        """Wrap lines as bulleted blocks with a blank spacer between blocks."""
-        out: List[str] = []
+    QUESTION_PHRASES = [
+        'what are', 'what is', 'what do', 'what did', 'what can', 'what should', 'what would',
+        'how do', 'how did', 'how can', 'how should', 'how would', 'how are', 'how is',
+        'why is', 'why are', 'why do', 'why did',
+        'when is', 'when are', 'when will',
+        'where is', 'where are',
+        'who is', 'who are', 'who will',
+        'can we', 'can you', 'can i',
+        'could we', 'could you',
+        'should we', 'should you',
+        'would we', 'would you',
+        'did we', 'did you', 'do we', 'do you',
+        'have we', 'have you', 'has anyone',
+        'is that', 'is there', 'are we', 'are there',
+        'will we', 'will you', 'will it',
+    ]
+
+    def looks_like_question(raw: str) -> bool:
+        text = (raw or '').strip()
+        if not text:
+            return False
+        if '?' in text:
+            return True
+        low = ' '.join(text.lower().split())
+        for prefix in (
+            'who', 'what', 'when', 'where', 'why', 'how',
+            'do', 'does', 'did', 'is', 'are', 'can', 'could',
+            'should', 'would', 'have', 'has', 'will'
+        ):
+            if low.startswith(prefix + ' '):
+                return True
+        padded = f' {low} '
+        for phrase in QUESTION_PHRASES:
+            if f' {phrase} ' in padded:
+                return True
+        return False
+
+    def wrap_bulleted(lines: List[str], width: int, bullet: str = "- ") -> List[Tuple[str, bool]]:
+        """Wrap lines as bulleted blocks with a blank spacer between blocks.
+
+        Returns (line_text, is_question) tuples so the caller can style questions.
+        """
+        out: List[Tuple[str, bool]] = []
         indent = " " * len(bullet)
         for raw in lines:
             raw = (raw or "").strip()
             if raw == "":
-                out.append("")
+                out.append(("", False))
                 continue
+            highlight = looks_like_question(raw)
             first = True
             wrap_width = max(1, width - len(bullet))
             wrapped = textwrap.wrap(raw, wrap_width) or [""]
             for seg in wrapped:
                 if first:
-                    out.append(bullet + seg)
+                    out.append((bullet + seg, highlight))
                     first = False
                 else:
-                    out.append(indent + seg)
-            out.append("")
+                    out.append((indent + seg, highlight))
+            out.append(("", False))
         return out
 
     def _ui(stdscr):
@@ -908,21 +1318,29 @@ def run_curses_ui(source: str, sink: Optional[str], vosk_label: str, llm_model: 
         stdscr.nodelay(True)
         stdscr.timeout(200)
 
-        title = f"Src: {source}  Sink: {sink or '-'}  ASR: {vosk_label}  LLM: {llm_model or '-'}"
-        footer = "q Quit  m Mark  n Note"
-
+        base_title = f"Src: {source}  Sink: {sink or '-'}  ASR: {vosk_label}  LLM: {llm_model or '-'}"
         pairs = init_colors()
+
+        msg_queue: queue.Queue[Tuple[str, float, bool]] = queue.Queue()
+        status_message = ""
+        status_expire = 0.0
+        status_requires_ack = False
+
+        def push_status(msg: str, duration: float = 4.0, sticky: bool = False):
+            msg_queue.put((msg, duration, sticky))
 
         note_mode = False
         note_buffer = ""
         left_offset = 0
-        # Start at top (no bottom-stick on first render)
         left_follow = False
         active_search = ""
         search_idx = -1  # index of last matched bullet line
         filter_query = ""
         capturing = False
         answering = False
+        active_pane = 'left'
+        right_offset = 0
+        right_follow = True
 
         def prompt_line(prompt_text: str) -> str:
             h, w = stdscr.getmaxyx()
@@ -943,6 +1361,18 @@ def run_curses_ui(source: str, sink: Optional[str], vosk_label: str, llm_model: 
         dbg("TUI started")
         while not tr.stop_event.is_set():
             h, w = stdscr.getmaxyx()
+            try:
+                while True:
+                    msg, duration, sticky = msg_queue.get_nowait()
+                    status_message = msg
+                    status_requires_ack = sticky
+                    status_expire = float('inf') if sticky else time.time() + max(0.5, duration)
+            except queue.Empty:
+                pass
+            if status_message and not status_requires_ack and time.time() > status_expire:
+                status_message = ""
+
+            context_text_current, context_label_list = state.get_context()
             title_h = 1
             footer_h = 1
             body_h = max(1, h - title_h - footer_h)
@@ -953,12 +1383,17 @@ def run_curses_ui(source: str, sink: Optional[str], vosk_label: str, llm_model: 
             right_w = max(1, w - left_w)
 
             stdscr.erase()
+            focus_label = 'Transcript' if active_pane == 'left' else 'Analysis'
+            title = f"{base_title}  Focus:{focus_label}"
             if pairs:
                 stdscr.addnstr(0, 0, title[:w], w, curses.color_pair(pairs['title']) | curses.A_BOLD)
             else:
                 stdscr.addnstr(0, 0, title[:w], w, curses.A_REVERSE)
 
             transcript, analysis, partial = state.snapshot()
+            chat_history = state.get_chat_history()
+            chat_available = bool(chat_prompt and api_key and llm_model)
+            chat_pending = state.has_pending_chat() if chat_available else False
 
             # Left pane layout:
             # - Top: live partial stream (word-wrapped) with dim style
@@ -1002,10 +1437,12 @@ def run_curses_ui(source: str, sink: Optional[str], vosk_label: str, llm_model: 
             else:
                 left_offset = max(0, min(left_offset, max_offset))
             view_lines = bullet_lines[left_offset:left_offset + available_rows]
-            for seg in view_lines:
+            for seg, is_question in view_lines:
                 if y >= 1 + body_h:
                     break
                 attr = curses.color_pair(pairs['left']) if pairs else 0
+                if is_question:
+                    attr |= curses.A_BOLD | curses.A_UNDERLINE
                 if active_search and active_search.lower() in seg.lower():
                     attr |= curses.A_REVERSE
                 stdscr.addnstr(y, 0, seg[: left_w - 2], left_w - 2, attr)
@@ -1023,45 +1460,77 @@ def run_curses_ui(source: str, sink: Optional[str], vosk_label: str, llm_model: 
 
             # Right pane: analysis
             right_x = left_w
-            ry = 1
-            right_header = None
+            right_lines: List[Tuple[str, int]] = []
+
+            def color(name: str, extra: int = 0) -> int:
+                return (curses.color_pair(pairs[name]) | extra) if pairs else extra
+
+            def add_wrapped_right(text: str, attr: int):
+                for seg in textwrap.wrap(text, right_w - 1) or [""]:
+                    right_lines.append((seg, attr))
+
+            def add_right_blank():
+                right_lines.append(("", color('right')))
+
+            header_parts: List[str] = []
             if not tr.has_vosk:
-                right_header = "ASR disabled (recording only)"
+                header_parts.append("ASR disabled (recording only)")
             if interview_mode:
                 status = "capturing" if capturing else ("answering" if answering else "idle")
-                extra = f"Interview mode: {status}"
-                if right_header:
-                    right_header += " · " + extra
-                else:
-                    right_header = extra
-            if context:
-                # Show number of context files if known
-                extra = f"CTX: {len(context_labels) if context_labels is not None else 'on'}"
-                if right_header:
-                    right_header += " · " + extra
-                else:
-                    right_header = extra
+                header_parts.append(f"Interview: {status}")
+            if context_text_current or context_label_list:
+                header_parts.append(f"CTX: {len(context_label_list)}" if context_label_list else "CTX:on")
+            if chat_available:
+                status = 'pending' if chat_pending else ('ready' if chat_history else 'idle')
+                header_parts.append(f"Chat: {status}")
+            if header_parts:
+                add_wrapped_right(" · ".join(header_parts), color('right', curses.A_BOLD))
+                add_right_blank()
+
+            if status_message:
+                add_wrapped_right(status_message, color('right', curses.A_REVERSE))
+                add_right_blank()
+
             initial_text = analysis or "Waiting for analysis..."
-            if right_header:
-                for seg in textwrap.wrap(right_header, right_w - 1) or [""]:
-                    if ry >= 1 + body_h:
-                        break
-                    attr = curses.color_pair(pairs['right']) | curses.A_BOLD if pairs else curses.A_BOLD
-                    stdscr.addnstr(ry, right_x, seg, right_w - 1, attr)
-                    ry += 1
-                if ry < 1 + body_h:
-                    ry += 1
             for line in initial_text.splitlines():
-                for seg in textwrap.wrap(line, right_w - 1) or [""]:
-                    if ry >= 1 + body_h:
-                        break
-                    attr = curses.color_pair(pairs['right']) if pairs else 0
-                    stdscr.addnstr(ry, right_x, seg, right_w - 1, attr)
-                    ry += 1
+                add_wrapped_right(line, color('right'))
+
+            if chat_history:
+                add_right_blank()
+                header = "Chatbot"
+                if chat_prompt_label and chat_prompt_label != 'builtin.chatbot':
+                    label = chat_prompt_label
+                    if os.path.sep in label:
+                        label = os.path.basename(label)
+                    header = f"Chatbot [{label}]"
+                add_wrapped_right(header, color('right', curses.A_BOLD))
+                for q, a, pending in chat_history[-12:]:
+                    add_wrapped_right(f"You> {q}" if q else "You> (blank question)", color('right'))
+                    ans_text = "…" if pending else (a or "(No answer)")
+                    attr = color('right', curses.A_DIM) if pending else color('right')
+                    add_wrapped_right(f"Bot> {ans_text}", attr)
+                    add_right_blank()
+
+            available_right_rows = body_h
+            max_offset_right = max(0, len(right_lines) - available_right_rows)
+            if right_follow:
+                right_offset = max_offset_right
+            else:
+                right_offset = max(0, min(right_offset, max_offset_right))
+
+            ry = 1
+            for idx in range(right_offset, min(len(right_lines), right_offset + available_right_rows)):
+                text, attr = right_lines[idx]
+                stdscr.addnstr(ry, right_x, text[: right_w - 1], right_w - 1, attr)
+                ry += 1
+            while ry < 1 + body_h:
+                stdscr.move(ry, right_x)
+                stdscr.clrtoeol()
+                ry += 1
 
             # Footer with elapsed time and key hints
             elapsed = time.strftime('%H:%M:%S', time.gmtime(time.time() - tr.start_time))
-            footer = f"q Quit  m Mark  n Note  / search (n/N next/prev)  \ filter  j/k scroll   t={elapsed}"
+            footer = f"Focus:{focus_label}  q Quit  m Mark  n Note  c Chat  C Context  Tab focus  Esc back  / search (n/N next/prev)  \\ filter  j/k scroll   t={elapsed}"
             if note_mode:
                 ft = f"note> {note_buffer}"[: w]
                 if pairs:
@@ -1117,7 +1586,7 @@ def run_curses_ui(source: str, sink: Optional[str], vosk_label: str, llm_model: 
                             idx = None
                             for i in range(total):
                                 j = (start + i) % total
-                                if ql in bullet_lines[j].lower():
+                                if ql in bullet_lines[j][0].lower():
                                     idx = j; break
                             if idx is not None:
                                 search_idx = idx
@@ -1130,7 +1599,7 @@ def run_curses_ui(source: str, sink: Optional[str], vosk_label: str, llm_model: 
                             idx = None
                             for i in range(total):
                                 j = (start - i) % total
-                                if ql in bullet_lines[j].lower():
+                                if ql in bullet_lines[j][0].lower():
                                     idx = j; break
                             if idx is not None:
                                 search_idx = idx
@@ -1142,6 +1611,73 @@ def run_curses_ui(source: str, sink: Optional[str], vosk_label: str, llm_model: 
                     note_mode = True
                     note_buffer = ""
                     dbg("Note mode entered")
+            elif ch == ord('c'):
+                user_msg = prompt_line('chat> ')
+                if not user_msg:
+                    continue
+                history_before = state.get_chat_history()
+                chat_id = state.add_chat_question(user_msg)
+                if chat_id == -1:
+                    continue
+                if not chat_available:
+                    state.set_chat_answer(chat_id, "Chatbot disabled. Set OPENAI_API_KEY and --llm-model.")
+                    push_status('Chatbot disabled; set OPENAI_API_KEY and --llm-model.', sticky=True)
+                    continue
+                transcript_snapshot = list(transcript)
+                ctx_text_snapshot, ctx_labels_snapshot = state.get_context()
+
+                def _chat_worker():
+                    ans = gpt_chat_response(
+                        chat_prompt or DEFAULT_CHAT_PROMPT,
+                        user_msg,
+                        transcript_snapshot,
+                        history_before,
+                        api_key,
+                        base_url,
+                        llm_model,
+                        context=(ctx_text_snapshot or None),
+                        context_labels=(ctx_labels_snapshot if ctx_labels_snapshot else None)
+                    )
+                    if ans:
+                        state.set_chat_answer(chat_id, ans)
+                        push_status('Chat answer ready (press Esc).', sticky=True)
+                    else:
+                        state.set_chat_answer(chat_id, "(No answer returned)")
+                        push_status('No chat answer returned (press Esc).', sticky=True)
+
+                threading.Thread(target=_chat_worker, daemon=True).start()
+            elif ch == ord('C'):
+                raw_entry = prompt_line('context path/url> ')
+                if not raw_entry:
+                    push_status('Context entry cancelled.', 3.0)
+                    continue
+                raw_entry = raw_entry.strip()
+                entry_id = canonical_context_id(raw_entry)
+                if not entry_id:
+                    push_status('Invalid context path or URL.', 4.0, sticky=True)
+                    continue
+                if state.has_context_entry(entry_id):
+                    push_status('Context already loaded.', 4.0)
+                    continue
+
+                def _context_worker(source: str, entry_canonical: str):
+                    try:
+                        text_chunk, labels_chunk = collect_context([source])
+                    except Exception as e:
+                        push_status(f'Context load failed: {e}', 6.0, sticky=True)
+                        return
+                    if not (text_chunk and text_chunk.strip()):
+                        push_status('No text extracted; check the source.', 5.0, sticky=True)
+                        return
+                    added = state.append_context_bundle(entry_canonical, text_chunk, labels_chunk)
+                    if added:
+                        label = labels_chunk[0] if labels_chunk else entry_canonical
+                        push_status(f'Context added: {label}', 4.0, sticky=True)
+                    else:
+                        push_status('Context already loaded.', 4.0)
+
+                push_status('Loading context…', 2.0)
+                threading.Thread(target=_context_worker, args=(raw_entry, entry_id), daemon=True).start()
             elif interview_mode and ch in (ord('i'), ord('I')):
                 if not capturing:
                     state.start_segment()
@@ -1153,25 +1689,45 @@ def run_curses_ui(source: str, sink: Optional[str], vosk_label: str, llm_model: 
                     dbg(f"Interview capture stopped; q_len={len(question) if question else 0}")
                     if question:
                         answering = True
+                        ctx_text_snapshot, ctx_labels_snapshot = state.get_context()
                         def _answer():
                             nonlocal answering
                             try:
-                                ans = gpt_with_prompt(interview_prompt or "You are an interview assistant.", question, api_key, base_url, llm_model, timeout=30.0, context=context)
+                                ans = gpt_with_prompt(
+                                    interview_prompt or "You are an interview assistant.",
+                                    question,
+                                    api_key,
+                                    base_url,
+                                    llm_model,
+                                    timeout=30.0,
+                                    context=(ctx_text_snapshot or None),
+                                    context_labels=(ctx_labels_snapshot if ctx_labels_snapshot else None)
+                                )
                                 if ans:
                                     state.add_qa(question, ans)
+                                    push_status('Interview answer ready (press Esc).', sticky=True)
                                 else:
                                     state.add_qa(question, "(No answer returned)")
+                                    push_status('Interview answer missing (press Esc).', sticky=True)
                             finally:
                                 answering = False
                         threading.Thread(target=_answer, daemon=True).start()
             elif ch == ord('j'):
-                left_follow = False
-                left_offset = min(max(0, len(bullet_lines) - available_rows), left_offset + 1)
-                if left_offset >= max(0, len(bullet_lines) - available_rows):
-                    left_follow = True
+                if active_pane == 'left':
+                    left_follow = False
+                    left_offset = min(max(0, len(bullet_lines) - available_rows), left_offset + 1)
+                    if left_offset >= max(0, len(bullet_lines) - available_rows):
+                        left_follow = True
+                else:
+                    right_follow = False
+                    right_offset = min(max_offset_right, right_offset + 1)
             elif ch == ord('k'):
-                left_follow = False
-                left_offset = max(0, left_offset - 1)
+                if active_pane == 'left':
+                    left_follow = False
+                    left_offset = max(0, left_offset - 1)
+                else:
+                    right_follow = False
+                    right_offset = max(0, right_offset - 1)
             elif ch == ord('/'):
                 q = prompt_line('search> ')
                 if not q:
@@ -1181,7 +1737,7 @@ def run_curses_ui(source: str, sink: Optional[str], vosk_label: str, llm_model: 
                     active_search = q
                     ql = q.lower()
                     # find first occurrence
-                    idx = next((i for i, txt in enumerate(bullet_lines) if ql in txt.lower()), None)
+                    idx = next((i for i, item in enumerate(bullet_lines) if ql in item[0].lower()), None)
                     if idx is not None:
                         search_idx = idx
                         left_follow = False
@@ -1195,6 +1751,28 @@ def run_curses_ui(source: str, sink: Optional[str], vosk_label: str, llm_model: 
                 q = prompt_line('filter> ')
                 filter_query = q
                 left_follow = True
+            elif ch in (9, curses.KEY_BTAB):
+                if active_pane == 'left':
+                    active_pane = 'right'
+                    right_follow = True
+                    push_status('Analysis pane focused (press Esc to return).', 3.0)
+                else:
+                    active_pane = 'left'
+                    left_follow = True
+                    push_status('Transcript pane focused.', 3.0)
+            elif ch == 27:  # ESC
+                if status_requires_ack:
+                    status_message = ""
+                    status_requires_ack = False
+                    status_expire = 0.0
+                elif active_pane == 'right':
+                    active_pane = 'left'
+                    left_follow = True
+                    status_message = ""
+                    status_expire = 0.0
+                else:
+                    status_message = ""
+                    status_expire = 0.0
 
         tr.stop_event.set()
 
@@ -1218,7 +1796,7 @@ def main():
     parser.add_argument("--vosk-model-path", dest="vosk_model_path", help="Path to Vosk model directory")
     parser.add_argument("--llm-model", dest="llm_model", help="LLM model name (e.g., gpt-4o-mini)")
     parser.add_argument("--openai-base-url", dest="openai_base_url", help="OpenAI-compatible base URL")
-    parser.add_argument("-C", "--context", dest="context", action="append", help="File or directory to use as context (.pdf, .md, .txt). Can repeat.")
+    parser.add_argument("-C", "--context", dest="context", action="append", help="File, directory, or http(s) URL to use as context (.pdf, .md, .txt, webpages). Can repeat.")
     parser.add_argument("--debug", dest="debug", action="store_true", help="Enable verbose logging to assistant.log")
     args, unknown = parser.parse_known_args()
 
@@ -1235,6 +1813,12 @@ def main():
     env_ctx = os.environ.get('CONTEXT_PATHS') or os.environ.get('CONTEXT')
     if env_ctx:
         context_paths.extend([p for p in env_ctx.split(':') if p])
+
+    context_entry_ids: List[str] = []
+    for raw in context_paths:
+        cid = canonical_context_id(raw)
+        if cid and cid not in context_entry_ids:
+            context_entry_ids.append(cid)
 
     sources = list_pulse_devices("sources")
     sinks = list_pulse_devices("sinks")
@@ -1292,6 +1876,8 @@ def main():
         summary_prompt = None
         summary_prompt_label = None
 
+    chat_prompt, chat_prompt_label = load_chat_prompt()
+
     if not api_key and interactive:
         try:
             entered = input("Enter OPENAI_API_KEY (blank to skip GPT): ").strip()
@@ -1322,14 +1908,16 @@ def main():
         try:
             context_text, context_labels = collect_context(context_paths)
             if context_text:
-                print(f"[=] Loaded context: {len(context_text)} chars from {len(context_labels)} file(s)")
-                dbg(f"Loaded context chars={len(context_text)} from files={len(context_labels)}")
+                print(f"[=] Loaded context: {len(context_text)} chars from {len(context_labels)} source(s)")
+                dbg(f"Loaded context chars={len(context_text)} from sources={len(context_labels)}")
             else:
-                print("[!] No valid context text loaded from provided -C/CONTEXT_PATHS. Ensure files exist and are .pdf/.md/.txt. For PDFs, install 'pdftotext' (poppler-utils).")
+                print("[!] No valid context text loaded from provided -C/CONTEXT_PATHS. Ensure files exist, URLs are reachable, and use .pdf/.md/.txt or webpage sources. For PDFs, install 'pdftotext' (poppler-utils).")
         except Exception as e:
             _log(f"Context load failed: {e}")
 
     state = SharedState()
+    initial_entries = context_entry_ids if context_labels else []
+    state.set_context_bundle(context_text or '', context_labels or [], initial_entries)
     tr = LiveTranscriber(src, session_dir, model_path, on_text=state.add_text, on_partial=state.set_partial)
     reader_thread = tr.run()
 
@@ -1339,7 +1927,7 @@ def main():
     analyzer_stop = tr.stop_event
     if not interview_mode:
         if api_key and llm_model:
-            t_an = threading.Thread(target=analyzer_loop, args=(state, api_key, base_url, llm_model, analyzer_stop, (summary_prompt or None), context_text or None), daemon=True)
+            t_an = threading.Thread(target=analyzer_loop, args=(state, api_key, base_url, llm_model, analyzer_stop, (summary_prompt or None)), daemon=True)
             t_an.start()
         else:
             state.set_analysis("Set OPENAI_API_KEY to enable live analysis.")
@@ -1347,9 +1935,10 @@ def main():
         state.set_analysis("Interview mode: press 'i' to capture a question; press 'i' again to stop and generate an answer.")
 
     vosk_label = tr.engine_label
-    run_curses_ui(src, sink, vosk_label, llm_model if api_key else None, state, tr, reader_thread, interview_mode=interview_mode, interview_prompt=summary_prompt or '', api_key=api_key, base_url=base_url, context=context_text or None, context_labels=context_labels or None)
+    run_curses_ui(src, sink, vosk_label, llm_model if api_key else None, state, tr, reader_thread, interview_mode=interview_mode, interview_prompt=summary_prompt or '', api_key=api_key, base_url=base_url, chat_prompt=chat_prompt, chat_prompt_label=chat_prompt_label)
 
     _, final_analysis, _ = state.snapshot()
+    ctx_text_final, ctx_labels_final = state.get_context()
     # Full-transcript pass for report
     try:
         full_text = "\n".join(tr.transcript_lines)
@@ -1368,53 +1957,100 @@ def main():
                 "Your goal is to provide comprehensive yet concise summaries that capture the essential elements of meetings in a structured format.\n\n"
                 "# STEPS\n\n"
                 "- Extract a brief overview of the meeting in 25 words or less, including the purpose and key participants into a section called OVERVIEW.\n\n"
-                "- Extract 10-20 of the most important discussion points from the meeting into a section called KEY POINTS. Focus on core topics, debates, and significant ideas discussed.\n\n"
-                "- Extract all action items and assignments mentioned in the meeting into a section called TASKS. Include responsible parties and deadlines where specified.\n\n"
-                "- Extract 5-10 of the most important decisions made during the meeting into a section called DECISIONS.\n\n"
-                "- Extract any notable challenges, risks, or concerns raised during the meeting into a section called CHALLENGES.\n\n"
-                "- Extract all deadlines, important dates, and milestones mentioned into a section called TIMELINE.\n\n"
-                "- Extract all references to documents, tools, projects, or resources mentioned into a section called REFERENCES.\n\n"
-                "- Extract 5-10 of the most important follow-up items or next steps into a section called NEXT STEPS.\n\n"
-                "# OUTPUT INSTRUCTIONS\n\n"
-                "- Only output Markdown.\n\n"
-                "- Write the KEY POINTS bullets as exactly 16 words.\n\n"
-                "- Write the TASKS bullets as exactly 16 words.\n\n"
-                "- Write the DECISIONS bullets as exactly 16 words.\n\n"
-                "- Write the NEXT STEPS bullets as exactly 16 words.\n\n"
-                "- Use bulleted lists for all sections, not numbered lists.\n\n"
-                "- Do not repeat information across sections.\n\n"
-                "- Do not start items with the same opening words.\n\n"
-                "- If information for a section is not available in the transcript, write \"No information available\".\n\n"
-                "- Do not include warnings or notes; only output the requested sections.\n\n"
-                "- Format each section header in bold using markdown.\n\n"
-                "# INPUT\n\n"
-                "INPUT:"
+        "- Extract 10-20 of the most important discussion points from the meeting into a section called KEY POINTS. Focus on core topics, debates, and significant ideas discussed.\n\n"
+        "- Extract all action items and assignments mentioned in the meeting into a section called TASKS. Include responsible parties and deadlines where specified.\n\n"
+        "- Extract 5-10 of the most important decisions made during the meeting into a section called DECISIONS.\n\n"
+        "- Extract any notable challenges, risks, or concerns raised during the meeting into a section called CHALLENGES.\n\n"
+        "- Extract all deadlines, important dates, and milestones mentioned into a section called TIMELINE.\n\n"
+        "- Extract all references to documents, tools, projects, or resources mentioned into a section called REFERENCES.\n\n"
+        "- Compare meeting statements against any provided context sources and capture overlaps, confirmations, or conflicts in a section called CONTEXT ALIGNMENT, citing the relevant source label.\n\n"
+        "- If no alignment exists, still include CONTEXT ALIGNMENT with the bullet `- No information available; meeting dialogue lacked references to provided external context sources or citations currently recorded.`\n\n"
+        "- Extract 5-10 of the most important follow-up items or next steps into a section called NEXT STEPS.\n\n"
+        "# OUTPUT INSTRUCTIONS\n\n"
+        "- Only output Markdown.\n\n"
+        "- Write the KEY POINTS bullets as exactly 16 words.\n\n"
+        "- Write the TASKS bullets as exactly 16 words.\n\n"
+        "- Write the DECISIONS bullets as exactly 16 words.\n\n"
+        "- Write the NEXT STEPS bullets as exactly 16 words.\n\n"
+        "- Write the CONTEXT ALIGNMENT bullets as exactly 16 words.\n\n"
+        "- If no alignment exists, output the exact bullet `- No information available; meeting dialogue lacked references to provided external context sources or citations currently recorded.`\n\n"
+        "- Use bulleted lists for all sections, not numbered lists.\n\n"
+        "- Do not repeat information across sections.\n\n"
+        "- Do not start items with the same opening words.\n\n"
+        "- For any bullet that relies on context rather than transcript alone, append [context: LABEL] using the label shown in the context headers.\n\n"
+        "- If information for a section is not available in the transcript, write \"No information available\".\n\n"
+        "- Do not include warnings or notes; only output the requested sections.\n\n"
+        "- Format each section header in bold using markdown.\n\n"
+        "# INPUT\n\n"
+        "INPUT:"
             )
             messages = [
-                {"role": "system", "content": prompt + ("\nUse CONTEXT if provided to ground references, but do not invent details." if (context_text or None) else "")},
+                {"role": "system", "content": prompt + ("\nUse CONTEXT if provided to ground references, but do not invent details." if (ctx_text_final or None) else "")},
             ]
-            if context_text:
-                messages.append({"role": "system", "content": ("CONTEXT (may be partial):\n" + context_text[-12000:])})
+            if ctx_labels_final:
+                src_blob = "\n".join(f"- {lbl}" for lbl in ctx_labels_final[:12])
+                messages.append({"role": "system", "content": "CONTEXT SOURCES:\n" + src_blob})
+            if ctx_text_final:
+                messages.append({"role": "system", "content": ("CONTEXT (may be partial):\n" + ctx_text_final[-12000:])})
             messages.append({"role": "user", "content": full_text[-20000:]})
-            data = {
+            data: Dict[str, object] = {
                 "model": llm_model,
                 "messages": messages,
                 "temperature": 0.2,
                 "max_tokens": 800,
             }
-            r = requests.post(url, headers=headers, json=data, timeout=35)
-            if r.status_code == 400 and "max_tokens" in r.text and "max_completion_tokens" in r.text:
-                data["max_completion_tokens"] = data.pop("max_tokens", 800)
+            attempt = 0
+            while True:
                 r = requests.post(url, headers=headers, json=data, timeout=35)
-            if r.status_code == 200:
-                executive = r.json().get("choices", [{}])[0].get("message", {}).get("content")
+                if r.status_code == 200:
+                    executive = r.json().get("choices", [{}])[0].get("message", {}).get("content")
+                    break
+                if r.status_code == 400 and "max_tokens" in r.text and "max_completion_tokens" in r.text and 'max_completion_tokens' not in data:
+                    data["max_completion_tokens"] = data.pop("max_tokens", 800)
+                    attempt += 1
+                    if attempt < 3:
+                        continue
+                if r.status_code == 400 and '"param": "temperature"' in r.text and 'temperature' in data:
+                    data.pop("temperature", None)
+                    attempt += 1
+                    if attempt < 3:
+                        continue
+                break
         except Exception:
             pass
+        if executive:
+            lines = executive.splitlines()
+            header_idx = next((i for i, line in enumerate(lines) if line.strip().lower().startswith("**context alignment**")), None)
+            if header_idx is None:
+                executive = executive.rstrip() + "\n\n**CONTEXT ALIGNMENT**\n" + _CONTEXT_FALLBACK_BULLET + "\n"
+            else:
+                has_bullet = False
+                for line in lines[header_idx + 1:]:
+                    stripped = line.strip()
+                    if stripped.startswith("**"):
+                        break
+                    if stripped.startswith("-"):
+                        has_bullet = True
+                        break
+                if not has_bullet:
+                    executive = executive.rstrip() + "\n" + _CONTEXT_FALLBACK_BULLET + "\n"
         if executive and not final_analysis:
             final_analysis = executive
     lists = state.get_lists()
     qas = state.get_qas()
-    tr.write_notes(source_label=src, sink_label=sink, llm_model=(llm_model if api_key else None), analysis_text=final_analysis or None, lists=lists, executive_summary=executive, prompt_label=summary_prompt_label, qas=qas if qas else None, context_files=(context_labels if context_labels else None))
+    chat_pairs = [(q, a or "") for q, a, pending in state.get_chat_history() if not pending]
+    tr.write_notes(
+        source_label=src,
+        sink_label=sink,
+        llm_model=(llm_model if api_key else None),
+        analysis_text=final_analysis or None,
+        lists=lists,
+        executive_summary=executive,
+        prompt_label=summary_prompt_label,
+        qas=qas if qas else None,
+        chats=chat_pairs if chat_pairs else None,
+        context_files=(ctx_labels_final if ctx_labels_final else None)
+    )
 
 
 if __name__ == "__main__":

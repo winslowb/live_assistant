@@ -18,6 +18,9 @@ You are an AI assistant specialized in analyzing meeting transcripts and extract
 
 - Extract all references to documents, tools, projects, or resources mentioned into a section called REFERENCES.
 
+- Compare meeting statements against any provided context sources and capture overlaps, confirmations, or conflicts in a section called CONTEXT ALIGNMENT, citing the relevant source label.
+- If no alignment exists, still include CONTEXT ALIGNMENT with the bullet `- No information available; meeting dialogue lacked references to provided external context sources or citations currently recorded.`
+
 - Extract 5-10 of the most important follow-up items or next steps into a section called NEXT STEPS.
 
 # OUTPUT INSTRUCTIONS
@@ -32,11 +35,16 @@ You are an AI assistant specialized in analyzing meeting transcripts and extract
 
 - Write the NEXT STEPS bullets as exactly 16 words.
 
+- Write the CONTEXT ALIGNMENT bullets as exactly 16 words.
+- If no alignment exists, output the exact bullet `- No information available; meeting dialogue lacked references to provided external context sources or citations currently recorded.`
+
 - Use bulleted lists for all sections, not numbered lists.
 
 - Do not repeat information across sections.
 
 - Do not start items with the same opening words.
+
+- For any bullet that relies on context rather than transcript alone, append [context: LABEL] using the label shown in the context headers.
 
 - If information for a section is not available in the transcript, write "No information available".
 
