@@ -1,0 +1,35 @@
+[profiles.default]
+# PulseAudio device names (use `pactl list short sources|sinks`)
+source = "alsa_output.pci-0000_00_1f.3.analog-stereo.monitor"
+sink = "alsa_output.pci-0000_00_1f.3.analog-stereo"
+
+# On‑device ASR (optional)
+vosk_model_path = "~/.cache/vosk-model-small-en-us-0.15"
+
+# LLM selection (secrets via env: set OPENAI_API_KEY)
+llm_model = "gpt-4o-mini"
+openai_base_url = "https://api.openai.com/v1"
+
+# Context files/dirs/URLs to preload
+context = [
+  "~/docs/agenda.md",
+  "~/docs/requirements/",
+]
+
+# Prompt locations (optional overrides)
+prompt_dir = "~/live_assistant/prompt_library"
+summary_prompt = "~/live_assistant/prompt_library/summary/system.md"
+chat_prompt = "~/live_assistant/prompt_library/chatbot/system.md"
+
+# Enable verbose log in session's assistant.log
+debug = false
+
+
+[profiles.work]
+source = "alsa_output.usb-Logitech_USB_Headset-00.analog-stereo.monitor"
+sink   = "alsa_output.pci-0000_2f_00.4.hdmi-stereo-extra1"
+vosk_model_path = "~/.cache/vosk-model-en-us-0.22"
+llm_model = "gpt-4o-mini"
+context = ["~/work/meeting-brief.md", "https://intranet.example.com/project-plan"]
+debug = true
+

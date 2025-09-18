@@ -96,6 +96,8 @@ Examples:
 - `i` – interview mode: start/stop capturing a question; answer is generated via LLM
 - `c` – ask the chatbot a question grounded in the recent transcript and context
 - `C` – add a context file or URL for immediate use by analysis/chatbot
+- `o` – toggle transcript order (newest-first ↔ oldest-first)
+- `i` – pause/resume transcript (non-interview mode)
 - `Tab` – switch focus between transcript and analysis/chat panes
 - `Esc` – dismiss sticky alerts and return focus to the transcript pane
 

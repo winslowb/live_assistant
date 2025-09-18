@@ -46,7 +46,10 @@ def _default_config_path() -> Path:
 
 def _load_config_file(path: Path) -> dict:
     try:
-        data = tomllib.loads(path.read_bytes()) if path.is_file() else {}
+        if not path.is_file():
+            return {}
+        with open(path, 'rb') as fp:
+            data = tomllib.load(fp)
         if not isinstance(data, dict):
             return {}
         return data
@@ -534,6 +537,9 @@ class SharedState:
         self._chat_history: List[Dict[str, object]] = []
         self._chat_seq = 0
 
+        # Pause control (when True, ignore incoming transcript/partial updates)
+        self.paused = False
+
     _STOPWORDS = set('a an and are as at be been being but by for from had has have how i if in into is it its of on or our over so than that the their them then there these they this to under up was we what when where which who will with you your'.split())
 
     @staticmethod
@@ -545,12 +551,16 @@ class SharedState:
 
     def add_text(self, line: str):
         with self.lock:
+            if self.paused:
+                return
             self.transcript.append(line)
             if self.segment_active:
                 self.segment_lines.append(line)
 
     def set_partial(self, text: str):
         with self.lock:
+            if self.paused:
+                return
             self.partial = text
             if self.segment_active:
                 self.segment_partial = text
@@ -586,6 +596,25 @@ class SharedState:
     def get_qas(self) -> List[Tuple[str, str]]:
         with self.lock:
             return list(self.qas)
+
+    # Pause helpers
+    def set_paused(self, value: bool) -> None:
+        with self.lock:
+            self.paused = bool(value)
+            if value:
+                # Clear transient partial when pausing so UI stops changing
+                self.partial = ''
+                self.segment_partial = ''
+    def toggle_paused(self) -> bool:
+        with self.lock:
+            self.paused = not self.paused
+            if self.paused:
+                self.partial = ''
+                self.segment_partial = ''
+            return self.paused
+    def is_paused(self) -> bool:
+        with self.lock:
+            return self.paused
 
     # Context helpers
     def set_context_bundle(self, text: str, labels: List[str], entries: List[str]):
@@ -1402,7 +1431,7 @@ def run_curses_ui(source: str, sink: Optional[str], vosk_label: str, llm_model: 
         note_mode = False
         note_buffer = ""
         left_offset = 0
-        left_follow = False
+        left_follow = True
         active_search = ""
         search_idx = -1  # index of last matched bullet line
         filter_query = ""
@@ -1417,10 +1446,12 @@ def run_curses_ui(source: str, sink: Optional[str], vosk_label: str, llm_model: 
             curses.curs_set(1)
             curses.echo()
             stdscr.nodelay(False); stdscr.timeout(-1)
-            stdscr.addnstr(h-1, 0, prompt_text[:w], w, curses.A_REVERSE)
+            maxw = max(1, w - 1)
+            stdscr.addnstr(h-1, 0, prompt_text[:maxw], maxw, curses.A_REVERSE)
             stdscr.clrtoeol(); stdscr.refresh()
             try:
-                s = stdscr.getstr(h-1, len(prompt_text), max(1, w - len(prompt_text) - 1))
+                start_x = min(len(prompt_text), maxw - 1)
+                s = stdscr.getstr(h-1, start_x, max(1, maxw - start_x - 1))
                 return (s.decode(errors='ignore').strip() if s else "")
             except Exception:
                 return ""
@@ -1455,10 +1486,11 @@ def run_curses_ui(source: str, sink: Optional[str], vosk_label: str, llm_model: 
             stdscr.erase()
             focus_label = 'Transcript' if active_pane == 'left' else 'Analysis'
             title = f"{base_title}  Focus:{focus_label}"
+            maxw = max(1, w - 1)
             if pairs:
-                stdscr.addnstr(0, 0, title[:w], w, curses.color_pair(pairs['title']) | curses.A_BOLD)
+                stdscr.addnstr(0, 0, title[:maxw], maxw, curses.color_pair(pairs['title']) | curses.A_BOLD)
             else:
-                stdscr.addnstr(0, 0, title[:w], w, curses.A_REVERSE)
+                stdscr.addnstr(0, 0, title[:maxw], maxw, curses.A_REVERSE)
 
             transcript, analysis, partial = state.snapshot()
             chat_history = state.get_chat_history()
@@ -1500,10 +1532,11 @@ def run_curses_ui(source: str, sink: Optional[str], vosk_label: str, llm_model: 
 
             # 2) Bulleted finalized transcript below
             available_rows = max(0, (1 + body_h) - y)
-            bullet_lines = wrap_bulleted(transcript, left_w - 2, bullet="• ")
+            source_lines = list(reversed(transcript)) if newest_first else list(transcript)
+            bullet_lines = wrap_bulleted(source_lines, left_w - 2, bullet="• ")
             max_offset = max(0, len(bullet_lines) - available_rows)
             if left_follow:
-                left_offset = max_offset
+                left_offset = 0 if newest_first else max_offset
             else:
                 left_offset = max(0, min(left_offset, max_offset))
             view_lines = bullet_lines[left_offset:left_offset + available_rows]
@@ -1602,16 +1635,16 @@ def run_curses_ui(source: str, sink: Optional[str], vosk_label: str, llm_model: 
             elapsed = time.strftime('%H:%M:%S', time.gmtime(time.time() - tr.start_time))
             footer = f"Focus:{focus_label}  q Quit  m Mark  n Note  c Chat  C Context  Tab focus  Esc back  / search (n/N next/prev)  \\ filter  j/k scroll   t={elapsed}"
             if note_mode:
-                ft = f"note> {note_buffer}"[: w]
+                ft = f"note> {note_buffer}"[: max(1, w-1)]
                 if pairs:
-                    stdscr.addnstr(h - 1, 0, ft, w, curses.color_pair(pairs['footer']))
+                    stdscr.addnstr(h - 1, 0, ft, max(1, w-1), curses.color_pair(pairs['footer']))
                 else:
-                    stdscr.addnstr(h - 1, 0, ft, w, curses.A_REVERSE)
+                    stdscr.addnstr(h - 1, 0, ft, max(1, w-1), curses.A_REVERSE)
             else:
                 if pairs:
-                    stdscr.addnstr(h - 1, 0, footer[:w], w, curses.color_pair(pairs['footer']))
+                    stdscr.addnstr(h - 1, 0, footer[:max(1, w-1)], max(1, w-1), curses.color_pair(pairs['footer']))
                 else:
-                    stdscr.addnstr(h - 1, 0, footer[:w], w, curses.A_REVERSE)
+                    stdscr.addnstr(h - 1, 0, footer[:max(1, w-1)], max(1, w-1), curses.A_REVERSE)
 
             stdscr.refresh()
 
@@ -1786,8 +1819,6 @@ def run_curses_ui(source: str, sink: Optional[str], vosk_label: str, llm_model: 
                 if active_pane == 'left':
                     left_follow = False
                     left_offset = min(max(0, len(bullet_lines) - available_rows), left_offset + 1)
-                    if left_offset >= max(0, len(bullet_lines) - available_rows):
-                        left_follow = True
                 else:
                     right_follow = False
                     right_offset = min(max_offset_right, right_offset + 1)
@@ -1795,9 +1826,20 @@ def run_curses_ui(source: str, sink: Optional[str], vosk_label: str, llm_model: 
                 if active_pane == 'left':
                     left_follow = False
                     left_offset = max(0, left_offset - 1)
+                    if (newest_first and left_offset <= 0) or ((not newest_first) and left_offset >= max(0, len(bullet_lines) - available_rows)):
+                        left_follow = True
                 else:
                     right_follow = False
                     right_offset = max(0, right_offset - 1)
+            elif (not interview_mode) and ch in (ord('i'), ord('I')):
+                paused = state.toggle_paused()
+                push_status('Transcript paused' if paused else 'Transcript resumed', 3.0, sticky=True)
+                if not paused:
+                    left_follow = True
+            elif ch == ord('o'):
+                newest_first = not newest_first
+                left_follow = True
+                push_status('Order: newest-first' if newest_first else 'Order: oldest-first', 3.0)
             elif ch == ord('/'):
                 q = prompt_line('search> ')
                 if not q:
@@ -1877,6 +1919,23 @@ def main():
     # Set global debug toggle (log file will be created once session_dir is known)
     # Load config profile first
     cfg = load_profile(args.profile, args.config)
+    # Announce selected config for easier troubleshooting
+    try:
+        cfg_path = cfg.get('_config_path')
+        cfg_name = cfg.get('_profile')
+        if isinstance(cfg_path, str) and Path(cfg_path).exists():
+            print(f"[=] Config: profile '{cfg_name}' from {cfg_path}")
+    except Exception:
+        pass
+
+    # Show which profile/path were selected (helps troubleshoot typos)
+    try:
+        cfg_path = cfg.get('_config_path')
+        cfg_name = cfg.get('_profile')
+        if isinstance(cfg_path, str) and Path(cfg_path).exists():
+            print(f"[=] Config: profile '{cfg_name}' from {cfg_path}")
+    except Exception:
+        pass
 
     # Export prompt env overrides from config if not already set
     if not os.environ.get('PROMPT_DIR') and isinstance(cfg.get('prompt_dir'), str):
@@ -1949,7 +2008,8 @@ def main():
     api_key = os.environ.get("OPENAI_API_KEY")
     base_url = args.openai_base_url or (cfg.get('openai_base_url') if isinstance(cfg.get('openai_base_url'), str) else None) or os.environ.get("OPENAI_BASE_URL")
     dbg(f"LLM config: model={llm_model} api_key_set={bool(api_key)} base_url={'set' if base_url else 'default'}")
-    if not args.llm_model and interactive:
+    # Prompt for model only if neither CLI nor config provided one
+    if not (args.llm_model or (isinstance(cfg.get('llm_model'), str) and cfg.get('llm_model'))) and interactive:
         try:
             entered_model = input(f"Enter GPT model to use [{llm_model}]: ").strip()
         except EOFError:
