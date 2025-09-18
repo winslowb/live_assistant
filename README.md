@@ -40,6 +40,8 @@ The app will prompt for capture/playback devices and an optional LLM model. Note
 - `--llm-model` `<name>` – model name for analysis (e.g., `gpt-4o-mini`)
 - `--openai-base-url` `<url>` – OpenAI‑compatible API base URL
 - `-C`, `--context` `<path>` – file or directory used as context; repeatable. Supports `.pdf`, `.md`, `.txt`.
+- `--config` `<path>` – path to a TOML config (default: `~/.config/live_assistant/config.toml` or `$XDG_CONFIG_HOME/live_assistant/config.toml`)
+- `--profile` `<name>` – profile inside the config (default/env: `LIVE_ASSISTANT_PROFILE` or `default`)
 
 Flags override environment and skip interactive prompts. View help: `python3 live_assistant/live_assistant.py --help`.
 
@@ -60,6 +62,23 @@ Examples:
 - `SUMMARY_PROMPT` – path to a specific summary prompt `.md`
 - `CHAT_PROMPT` – path to a chatbot system prompt `.md`
 - `CONTEXT_PATHS` – colon‑separated list of context paths (files or directories)
+- `LIVE_ASSISTANT_CONFIG` – overrides default config path
+- `LIVE_ASSISTANT_PROFILE` – selects config profile if `--profile` not provided
+
+**Config & Profiles**
+- Create `~/.config/live_assistant/config.toml` (or set `LIVE_ASSISTANT_CONFIG`). See `live_assistant/config.example.toml` for a template.
+- Define profiles under `[profiles.<name>]` with keys:
+  - `source`, `sink` – PulseAudio device names
+  - `vosk_model_path` – directory to a Vosk model
+  - `llm_model`, `openai_base_url` – LLM defaults (keep API keys in env)
+  - `context` – list of files/dirs/URLs to preload as grounding context
+  - `prompt_dir`, `summary_prompt`, `chat_prompt` – prompt discovery/overrides
+  - `debug` – boolean to enable verbose logging
+- Select a profile via `--profile <name>` or `LIVE_ASSISTANT_PROFILE`.
+- Precedence (highest → lowest): CLI flags → environment → config profile.
+- Examples:
+  - `python3 live_assistant.py --profile work`
+  - `LIVE_ASSISTANT_PROFILE=default python3 live_assistant.py`
 
 **Prompt Library**
 - Prompts are discovered in `prompt_library/` and any directory containing “prompt”.

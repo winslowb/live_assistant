@@ -14,6 +14,7 @@ from typing import Optional, List, Tuple, Dict
 from pathlib import Path
 import wave
 import argparse
+import tomllib
 from html import unescape
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
@@ -27,6 +28,75 @@ try:
     import vosk  # type: ignore
 except Exception:
     vosk = None
+
+
+# ----------------------
+# Profiled config support
+# ----------------------
+
+def _default_config_path() -> Path:
+    env = os.environ.get("LIVE_ASSISTANT_CONFIG")
+    if env:
+        return Path(env).expanduser().resolve()
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    if xdg:
+        return Path(xdg).expanduser() / "live_assistant" / "config.toml"
+    return Path.home() / ".config" / "live_assistant" / "config.toml"
+
+
+def _load_config_file(path: Path) -> dict:
+    try:
+        data = tomllib.loads(path.read_bytes()) if path.is_file() else {}
+        if not isinstance(data, dict):
+            return {}
+        return data
+    except Exception:
+        return {}
+
+
+def load_profile(profile: str | None, config_path: str | None) -> dict:
+    """Load settings for the selected profile from a TOML config.
+
+    Structure:
+    [profiles.default]
+    source = "alsa_output.pci-0000_00_1f.3.analog-stereo.monitor"
+    sink = "alsa_output.pci-0000_00_1f.3.analog-stereo"
+    vosk_model_path = "~/.cache/vosk-model-small-en-us-0.15"
+    llm_model = "gpt-4o-mini"
+    openai_base_url = "https://api.openai.com/v1"
+    context = ["~/docs/agenda.md", "https://example.com/spec"]
+    prompt_dir = "~/live_assistant/prompt_library"
+    summary_prompt = "~/live_assistant/prompt_library/summary/system.md"
+    chat_prompt = "~/live_assistant/prompt_library/chatbot/system.md"
+    debug = true
+    """
+    path = Path(config_path).expanduser().resolve() if config_path else _default_config_path()
+    cfg = _load_config_file(path)
+    profiles = cfg.get("profiles") or {}
+    if not isinstance(profiles, dict):
+        profiles = {}
+    # Determine profile name
+    name = profile or os.environ.get("LIVE_ASSISTANT_PROFILE") or "default"
+    selected = profiles.get(name) if isinstance(profiles.get(name), dict) else {}
+    # Normalize list types and expanduser
+    out: dict[str, object] = {}
+    for k, v in selected.items():
+        if isinstance(v, str):
+            try:
+                out[k] = str(Path(v).expanduser()) if v.startswith("~") else v
+            except Exception:
+                out[k] = v
+        elif isinstance(v, list):
+            norm: list[str] = []
+            for it in v:
+                if isinstance(it, str):
+                    norm.append(str(Path(it).expanduser()) if it.startswith("~") else it)
+            out[k] = norm
+        else:
+            out[k] = v
+    out["_config_path"] = str(path)
+    out["_profile"] = name
+    return out
 
 
 def list_pulse_devices(kind: str) -> List[Tuple[str, str]]:
@@ -1791,6 +1861,8 @@ def main():
     print("=== Live Assistant (TUI) ===")
 
     parser = argparse.ArgumentParser(description="Live Assistant TUI")
+    parser.add_argument("--config", dest="config", help="Path to TOML config (default: XDG/~/.config/live_assistant/config.toml)")
+    parser.add_argument("--profile", dest="profile", help="Profile name in config (default/env: LIVE_ASSISTANT_PROFILE or 'default')")
     parser.add_argument("--source", dest="source", help="PulseAudio source name (capture)")
     parser.add_argument("--sink", dest="sink", help="PulseAudio sink name (playback)")
     parser.add_argument("--vosk-model-path", dest="vosk_model_path", help="Path to Vosk model directory")
@@ -1803,13 +1875,29 @@ def main():
     interactive = sys.stdin.isatty()
 
     # Set global debug toggle (log file will be created once session_dir is known)
+    # Load config profile first
+    cfg = load_profile(args.profile, args.config)
+
+    # Export prompt env overrides from config if not already set
+    if not os.environ.get('PROMPT_DIR') and isinstance(cfg.get('prompt_dir'), str):
+        os.environ['PROMPT_DIR'] = str(cfg['prompt_dir'])
+    if not os.environ.get('SUMMARY_PROMPT') and isinstance(cfg.get('summary_prompt'), str):
+        os.environ['SUMMARY_PROMPT'] = str(cfg['summary_prompt'])
+    if not os.environ.get('CHAT_PROMPT') and isinstance(cfg.get('chat_prompt'), str):
+        os.environ['CHAT_PROMPT'] = str(cfg['chat_prompt'])
+
+    # Prepare DEBUG with cli > env > config precedence
     global DEBUG
-    DEBUG = bool(args.debug or os.environ.get('DEBUG'))
+    DEBUG = bool(args.debug or os.environ.get('DEBUG') or cfg.get('debug'))
 
     # Prepare context (from CLI or env var CONTEXT_PATHS=path1:path2,...)
     context_paths: List[str] = []
     if args.context:
         context_paths.extend(args.context)
+    # Config-provided context entries
+    cfg_ctx = cfg.get('context')
+    if isinstance(cfg_ctx, list):
+        context_paths.extend([p for p in cfg_ctx if isinstance(p, str)])
     env_ctx = os.environ.get('CONTEXT_PATHS') or os.environ.get('CONTEXT')
     if env_ctx:
         context_paths.extend([p for p in env_ctx.split(':') if p])
@@ -1826,7 +1914,8 @@ def main():
         print("[!] No PulseAudio sources found. Is Pulse running?\n    Try: pactl list short sources")
         sys.exit(1)
 
-    src = args.source
+    # CLI > config for device selection
+    src = args.source or (cfg.get('source') if isinstance(cfg.get('source'), str) else None)
     if not src:
         src = choose_from_list("Select capture source (e.g., a 'monitor' for system audio):", sources) if interactive else None
     if not src:
@@ -1834,13 +1923,13 @@ def main():
         return
     else:
         dbg(f"Using source: {src}")
-    sink = args.sink
+    sink = args.sink or (cfg.get('sink') if isinstance(cfg.get('sink'), str) else None)
     if not sink and sinks and interactive:
         sink = choose_from_list("Select playback sink (optional):", sinks)
         if sink:
             dbg(f"Using sink: {sink}")
 
-    model_path = args.vosk_model_path if args.vosk_model_path else (choose_vosk_model_path() if vosk else None)
+    model_path = args.vosk_model_path or (cfg.get('vosk_model_path') if isinstance(cfg.get('vosk_model_path'), str) else None) or (choose_vosk_model_path() if vosk else None)
     if vosk and model_path:
         print(f"[=] Using Vosk model at: {model_path}")
         dbg(f"Vosk model path: {model_path}")
@@ -1856,9 +1945,9 @@ def main():
     session_dir = os.path.expanduser(os.path.join("~", "recordings", f"session_{session_ts}"))
     os.makedirs(session_dir, exist_ok=True)
 
-    llm_model = args.llm_model or os.environ.get("LLM_MODEL") or os.environ.get("OPENAI_MODEL") or "gpt-4o-mini"
+    llm_model = args.llm_model or (cfg.get('llm_model') if isinstance(cfg.get('llm_model'), str) else None) or os.environ.get("LLM_MODEL") or os.environ.get("OPENAI_MODEL") or "gpt-4o-mini"
     api_key = os.environ.get("OPENAI_API_KEY")
-    base_url = args.openai_base_url or os.environ.get("OPENAI_BASE_URL")
+    base_url = args.openai_base_url or (cfg.get('openai_base_url') if isinstance(cfg.get('openai_base_url'), str) else None) or os.environ.get("OPENAI_BASE_URL")
     dbg(f"LLM config: model={llm_model} api_key_set={bool(api_key)} base_url={'set' if base_url else 'default'}")
     if not args.llm_model and interactive:
         try:
