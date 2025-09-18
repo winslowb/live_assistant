@@ -116,7 +116,10 @@ Examples:
 
 **Executive Summary**
 - After quitting the TUI, a longer summary can be generated if `OPENAI_API_KEY` is set.
-- Uses the full transcript (last slice) with a structured prompt; output is added to the notes file.
+- The final report layout is driven by the selected prompt markdown.
+  - Pick a file under `prompt_library/` (e.g., `meeting.md`, `youtube.md`) or provide one via `SUMMARY_PROMPT`.
+  - The assistant sends the chosen prompt as the system instruction; no hard‑coded meeting layout is applied.
+  - Context sources and optional context text are provided as additional system messages for grounding.
 
 **Troubleshooting**
 - “No PulseAudio sources found” or connection refused:
