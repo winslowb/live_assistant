@@ -19,11 +19,35 @@ from html import unescape
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 import urllib.error
+import termios
+import tty
+
+
+def _status_step(message: str, done_label: str = "done"):
+    """Print a status line and return a finisher callable."""
+    sys.stdout.write(message)
+    sys.stdout.flush()
+    def _finish(label: Optional[str] = None):
+        sys.stdout.write((label or done_label) + "\n")
+        sys.stdout.flush()
+    return _finish
+
+
+def _restore_terminal_state():
+    if sys.stdin.isatty():
+        try:
+            subprocess.run(['stty', 'sane'], check=False)
+        except Exception:
+            pass
 # Debug/verbose logging toggle
 DEBUG = False
 # Optional Vosk import
 try:
     import vosk  # type: ignore
+    try:
+        vosk.SetLogLevel(-1)
+    except Exception:
+        pass
 except Exception:
     vosk = None
 # ----------------------
@@ -109,6 +133,64 @@ def _prompt_yes_no(question: str, default: bool | None = None) -> bool:
             return default
         if ans in ("y", "yes"): return True
         if ans in ("n", "no"): return False
+
+def _prompt_yes_no_single_key(question: str, default: bool | None = None) -> bool:
+    """Prompt for y/n where the terminal might still be in no-echo mode."""
+    if default is True:
+        suffix = " [Y/n]: "
+    elif default is False:
+        suffix = " [y/N]: "
+    else:
+        suffix = " [y/n]: "
+    sys.stdout.write(question + suffix)
+    sys.stdout.flush()
+    fd = None
+    old_settings = None
+    try:
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        tty.setcbreak(fd)
+    except Exception:
+        fd = None
+        old_settings = None
+    try:
+        while True:
+            try:
+                ch = sys.stdin.read(1)
+            except Exception:
+                ch = ""
+            if not ch:
+                if default is not None:
+                    sys.stdout.write("\n")
+                    sys.stdout.flush()
+                    return default
+                continue
+            if ch in ("\r", "\n"):
+                if default is not None:
+                    sys.stdout.write("\n")
+                    sys.stdout.flush()
+                    return default
+                sys.stdout.write(question + suffix)
+                sys.stdout.flush()
+                continue
+            low = ch.lower()
+            if low in ("y", "n"):
+                sys.stdout.write(ch + "\n")
+                sys.stdout.flush()
+                return low == "y"
+            # Ignore other keys but show prompt again so user knows we're waiting
+            sys.stdout.write(question + suffix)
+            sys.stdout.flush()
+    finally:
+        if fd is not None and old_settings is not None:
+            try:
+                termios.tcflush(fd, termios.TCIFLUSH)
+            except Exception:
+                pass
+            try:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            except Exception:
+                pass
 def _escape_toml_string(s: str) -> str:
     return '"' + s.replace('\\', '\\').replace('"', '\"') + '"'
 def _dump_profiles_toml(profiles: dict[str, dict[str, object]]) -> str:
@@ -919,7 +1001,7 @@ class LiveTranscriber:
         t_reader.start()
         dbg("Reader thread launched")
         return t_reader
-    def write_notes(self, source_label: str, sink_label: Optional[str], llm_model: Optional[str], analysis_text: Optional[str], lists: Optional[Tuple[List[str], List[str], List[str], List[str]]] = None, executive_summary: Optional[str] = None, prompt_label: Optional[str] = None, qas: Optional[List[Tuple[str, str]]] = None, chats: Optional[List[Tuple[str, str]]] = None, context_files: Optional[List[str]] = None):
+    def write_notes(self, source_label: str, sink_label: Optional[str], llm_model: Optional[str], analysis_text: Optional[str], lists: Optional[Tuple[List[str], List[str], List[str], List[str]]] = None, executive_summary: Optional[str] = None, prompt_label: Optional[str] = None, qas: Optional[List[Tuple[str, str]]] = None, chats: Optional[List[Tuple[str, str]]] = None, context_files: Optional[List[str]] = None, post_session_chats: Optional[List[Tuple[str, str]]] = None):
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         notes_path = os.path.join(self.session_dir, f"notes_{ts}.md")
         duration = time.time() - self.start_time
@@ -956,6 +1038,12 @@ class LiveTranscriber:
             if chats:
                 f.write("## Live Chatbot Exchanges\n")
                 for i, (q, a) in enumerate(chats, start=1):
+                    f.write(f"\n**You {i}.** {q}\n\n")
+                    f.write(f"**Assistant.** {a}\n")
+                f.write("\n")
+            if post_session_chats:
+                f.write("## Post-Session Chat\n")
+                for i, (q, a) in enumerate(post_session_chats, start=1):
                     f.write(f"\n**You {i}.** {q}\n\n")
                     f.write(f"**Assistant.** {a}\n")
                 f.write("\n")
@@ -1005,7 +1093,7 @@ class LiveTranscriber:
             f.write("## Full Transcript\n\n")
             for line in self.transcript_lines:
                 f.write(line + "\n")
-        print(f"[+] Notes saved: {notes_path}")
+        return notes_path
 LOG_PATH: Optional[str] = None
 def _log(msg: str):
     try:
@@ -1172,7 +1260,20 @@ def gpt_with_prompt(prompt_md: str, user_input: str, api_key: Optional[str], bas
                 return None
     except Exception:
         return None
-def gpt_chat_response(prompt_md: str, question: str, transcript_lines: List[str], chat_history: List[Tuple[str, Optional[str], bool]], api_key: Optional[str], base_url: Optional[str], model: Optional[str], timeout: float = 25.0, context: Optional[str] = None, context_labels: Optional[List[str]] = None) -> Optional[str]:
+def gpt_chat_response(
+    prompt_md: str,
+    question: str,
+    transcript_lines: List[str],
+    chat_history: List[Tuple[str, Optional[str], bool]],
+    api_key: Optional[str],
+    base_url: Optional[str],
+    model: Optional[str],
+    timeout: float = 25.0,
+    context: Optional[str] = None,
+    context_labels: Optional[List[str]] = None,
+    *,
+    use_full_transcript: bool = False,
+) -> Optional[str]:
     if not api_key or not model:
         return None
     try:
@@ -1190,12 +1291,17 @@ def gpt_chat_response(prompt_md: str, question: str, transcript_lines: List[str]
     if context:
         messages.append({"role": "system", "content": "CONTEXT (truncated):\n" + context[-12000:]})
     if transcript_lines:
-        snippet_lines = transcript_lines[-80:]
-        if snippet_lines:
-            snippet = "\n".join(snippet_lines)
-            if len(snippet) > 6000:
-                snippet = snippet[-6000:]
-            messages.append({"role": "system", "content": "RECENT TRANSCRIPT:\n" + snippet})
+        if use_full_transcript:
+            joined = "\n".join(transcript_lines)
+            snippet = joined[-20000:]
+            messages.append({"role": "system", "content": "FULL TRANSCRIPT (truncated):\n" + snippet})
+        else:
+            snippet_lines = transcript_lines[-80:]
+            if snippet_lines:
+                snippet = "\n".join(snippet_lines)
+                if len(snippet) > 6000:
+                    snippet = snippet[-6000:]
+                messages.append({"role": "system", "content": "RECENT TRANSCRIPT:\n" + snippet})
     history_tail = chat_history[-6:]
     for q_prev, a_prev, pending in history_tail:
         if pending:
@@ -1269,6 +1375,61 @@ def gpt_chat_response(prompt_md: str, question: str, transcript_lines: List[str]
     except Exception as e:
         _log(f"Chatbot call exception: {e}")
         return None
+
+def post_session_chat_loop(
+    transcript_lines: List[str],
+    context_text: Optional[str],
+    context_labels: List[str],
+    *,
+    api_key: Optional[str],
+    base_url: Optional[str],
+    model: Optional[str],
+    chat_prompt: str,
+) -> List[Tuple[str, str]]:
+    """Interactive post-session chat using the full transcript and any context."""
+    if not api_key or not model:
+        print("[!] Cannot start post-session chat without OPENAI_API_KEY and --llm-model.")
+        return []
+    _restore_terminal_state()
+    print("\n[=] Starting post-session chat…", flush=True)
+    print("Type follow-up questions about the meeting. Press Enter on a blank line or type 'exit' to finish.\n", flush=True)
+    history: List[Tuple[str, Optional[str], bool]] = []
+    logged_pairs: List[Tuple[str, str]] = []
+    while True:
+        try:
+            question = input("post-chat> ")
+        except EOFError:
+            print()
+            break
+        if question is None:
+            break
+        question = question.strip()
+        if not question:
+            break
+        if question.lower() in {"exit", "quit", "/exit", "/quit"}:
+            break
+        answer = gpt_chat_response(
+            chat_prompt,
+            question,
+            transcript_lines,
+            history,
+            api_key,
+            base_url,
+            model,
+            context=context_text,
+            context_labels=context_labels,
+            use_full_transcript=True,
+        )
+        if answer:
+            answer = answer.strip()
+            print(f"\n{answer}\n", flush=True)
+            logged_pairs.append((question, answer))
+        else:
+            answer = "(No answer returned)"
+            print(f"\n{answer}\n", flush=True)
+        history.append((question, answer, False))
+    return logged_pairs
+
 def analyzer_loop(state: SharedState, api_key: Optional[str], base_url: Optional[str], model: Optional[str], stop_event: threading.Event, prompt_md: Optional[str] = None):
     def parse_blocks(s: str) -> Tuple[List[str], List[str], List[str], List[str]]:
         actions: List[str] = []
@@ -1902,6 +2063,7 @@ def main():
     parser.add_argument("--openai-base-url", dest="openai_base_url", help="OpenAI-compatible base URL")
     parser.add_argument("-C", "--context", dest="context", action="append", help="File, directory, or http(s) URL to use as context (.pdf, .md, .txt, webpages). Can repeat.")
     parser.add_argument("--debug", dest="debug", action="store_true", help="Enable verbose logging to assistant.log")
+    parser.add_argument("--post-chat", dest="post_chat", action="store_true", help="After recording, open a chat over the captured transcript.")
     args, unknown = parser.parse_known_args()
     interactive = sys.stdin.isatty()
     # Set global debug toggle (log file will be created once session_dir is known)
@@ -2070,16 +2232,20 @@ def main():
         order_val = None
     initial_newest_first = False if (isinstance(order_val, str) and order_val.strip().lower() == 'oldest') else True
     run_curses_ui(src, sink, vosk_label, llm_model if api_key else None, state, tr, reader_thread, interview_mode=interview_mode, interview_prompt=summary_prompt or '', api_key=api_key, base_url=base_url, chat_prompt=chat_prompt, chat_prompt_label=chat_prompt_label, initial_newest_first=initial_newest_first)
+    _restore_terminal_state()
+    print("\n[=] Finalizing session…")
     _, final_analysis, _ = state.snapshot()
     ctx_text_final, ctx_labels_final = state.get_context()
-    # Full-transcript pass for report
+    prepare_done = _status_step("  • Preparing transcript… ")
     try:
         full_text = "\n".join(tr.transcript_lines)
+        prepare_done()
     except Exception:
         full_text = None
+        prepare_done("failed")
     executive = None
     if api_key and llm_model and full_text:
-        # Final summary driven by the selected prompt markdown (if any)
+        summary_done = _status_step("  • Generating executive summary… ")
         try:
             import requests  # type: ignore
             url = (base_url.rstrip('/') if base_url else "https://api.openai.com/v1") + "/chat/completions"
@@ -2101,10 +2267,12 @@ def main():
                 "max_tokens": 800,
             }
             attempt = 0
+            summary_success = False
             while True:
                 r = requests.post(url, headers=headers, json=data, timeout=35)
                 if r.status_code == 200:
                     executive = r.json().get("choices", [{}])[0].get("message", {}).get("content")
+                    summary_success = True
                     break
                 if r.status_code == 400 and "max_tokens" in r.text and "max_completion_tokens" in r.text and 'max_completion_tokens' not in data:
                     data["max_completion_tokens"] = data.pop("max_tokens", 800)
@@ -2117,12 +2285,47 @@ def main():
                     if attempt < 3:
                         continue
                 break
+            if summary_success:
+                summary_done()
+            else:
+                summary_done("skipped")
         except Exception:
-            pass
+            summary_done("failed")
+    else:
+        if not (api_key and llm_model):
+            print("  • Generating executive summary… skipped (LLM disabled)")
+        elif not full_text:
+            print("  • Generating executive summary… skipped (no transcript)")
     lists = state.get_lists()
     qas = state.get_qas()
     chat_pairs = [(q, a or "") for q, a, pending in state.get_chat_history() if not pending]
-    tr.write_notes(
+    post_chat_pairs: List[Tuple[str, str]] = []
+    if interactive and api_key and llm_model:
+        start_post_chat = False
+        if args.post_chat:
+            start_post_chat = True
+        else:
+            try:
+                print()
+                _restore_terminal_state()
+                start_post_chat = _prompt_yes_no_single_key("Start post-session chat with the captured transcript?", False)
+            except Exception:
+                start_post_chat = False
+        if start_post_chat:
+            _restore_terminal_state()
+            post_chat_pairs = post_session_chat_loop(
+                tr.transcript_lines,
+                ctx_text_final or None,
+                ctx_labels_final or [],
+                api_key=api_key,
+                base_url=base_url,
+                model=llm_model,
+                chat_prompt=chat_prompt or DEFAULT_CHAT_PROMPT,
+            )
+    elif args.post_chat and not interactive:
+        print("[!] Post-session chat requires an interactive terminal.")
+    notes_status = _status_step("  • Writing session notes… ")
+    notes_path = tr.write_notes(
         source_label=src,
         sink_label=sink,
         llm_model=(llm_model if api_key else None),
@@ -2132,7 +2335,13 @@ def main():
         prompt_label=summary_prompt_label,
         qas=qas if qas else None,
         chats=chat_pairs if chat_pairs else None,
-        context_files=(ctx_labels_final if ctx_labels_final else None)
+        context_files=(ctx_labels_final if ctx_labels_final else None),
+        post_session_chats=(post_chat_pairs if post_chat_pairs else None),
     )
+    if notes_path:
+        notes_status(f"saved to {notes_path}")
+    else:
+        notes_status("failed")
+    print("[✓] Session complete.")
 if __name__ == "__main__":
     main()
