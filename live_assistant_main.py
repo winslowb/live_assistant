@@ -39,6 +39,13 @@ def _restore_terminal_state():
             subprocess.run(['stty', 'sane'], check=False)
         except Exception:
             pass
+
+
+def _slugify(value: str) -> str:
+    import re
+    slug = re.sub(r'[^a-zA-Z0-9]+', '-', value.strip().lower())
+    slug = re.sub(r'-{2,}', '-', slug).strip('-')
+    return slug or 'session'
 # Debug/verbose logging toggle
 DEBUG = False
 # Optional Vosk import
@@ -888,9 +895,10 @@ class SharedState:
         with self.lock:
             return (list(self.actions), list(self.questions), list(self.decisions), list(self.topics))
 class LiveTranscriber:
-    def __init__(self, source: str, session_dir: str, model_path: Optional[str], on_text=None, on_partial=None):
+    def __init__(self, source: str, session_dir: str, model_path: Optional[str], *, session_label: Optional[str] = None, on_text=None, on_partial=None):
         self.source = source
         self.session_dir = session_dir
+        self.session_path = Path(session_dir)
         self.model_path = model_path
         self.stop_event = threading.Event()
         self.transcript_lines: List[str] = []
@@ -904,6 +912,7 @@ class LiveTranscriber:
         self.on_partial = on_partial
         self.has_vosk = False
         self.recognizer = None
+        self.session_label = session_label.strip() if isinstance(session_label, str) else None
         if vosk and self.model_path and os.path.isdir(self.model_path):
             try:
                 model = vosk.Model(self.model_path)
@@ -915,8 +924,8 @@ class LiveTranscriber:
                 self.has_vosk = False
         dbg(f"LiveTranscriber init: source={self.source} has_vosk={self.has_vosk} engine={self.engine_label}")
     def _open_wave(self):
-        wav_path = os.path.join(self.session_dir, "audio.wav")
-        wf = wave.open(wav_path, 'wb')
+        wav_path = self.session_path / "audio.wav"
+        wf = wave.open(str(wav_path), 'wb')
         wf.setnchannels(1)
         wf.setsampwidth(2)
         wf.setframerate(16000)
@@ -940,7 +949,7 @@ class LiveTranscriber:
         t = self._sec()
         self.notes.append((t, text))
     def run(self) -> threading.Thread:
-        os.makedirs(self.session_dir, exist_ok=True)
+        self.session_path.mkdir(parents=True, exist_ok=True)
         self._open_wave()
         self._spawn_ffmpeg()
         if not self.proc or not self.proc.stdout:
@@ -1001,9 +1010,14 @@ class LiveTranscriber:
         t_reader.start()
         dbg("Reader thread launched")
         return t_reader
-    def write_notes(self, source_label: str, sink_label: Optional[str], llm_model: Optional[str], analysis_text: Optional[str], lists: Optional[Tuple[List[str], List[str], List[str], List[str]]] = None, executive_summary: Optional[str] = None, prompt_label: Optional[str] = None, qas: Optional[List[Tuple[str, str]]] = None, chats: Optional[List[Tuple[str, str]]] = None, context_files: Optional[List[str]] = None, post_session_chats: Optional[List[Tuple[str, str]]] = None):
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        notes_path = os.path.join(self.session_dir, f"notes_{ts}.md")
+    def write_notes(self, source_label: str, sink_label: Optional[str], llm_model: Optional[str], analysis_text: Optional[str], lists: Optional[Tuple[List[str], List[str], List[str], List[str]]] = None, executive_summary: Optional[str] = None, prompt_label: Optional[str] = None, qas: Optional[List[Tuple[str, str]]] = None, chats: Optional[List[Tuple[str, str]]] = None, context_files: Optional[List[str]] = None, post_session_chats: Optional[List[Tuple[str, str]]] = None) -> Optional[str]:
+        date_token = datetime.now().strftime("%Y-%m-%d")
+        candidate = self.session_path / f"notes_{date_token}.md"
+        counter = 2
+        while candidate.exists():
+            candidate = self.session_path / f"notes_{date_token}_{counter}.md"
+            counter += 1
+        notes_path = candidate
         duration = time.time() - self.start_time
         with open(notes_path, "w", encoding="utf-8") as f:
             f.write(f"# Session Notes - {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n")
@@ -1012,6 +1026,8 @@ class LiveTranscriber:
             if sink_label:
                 f.write(f"- Sink: `{sink_label}`\n")
             f.write(f"- Engine: `{self.engine_label}`\n")
+            if self.session_label:
+                f.write(f"- Session: `{self.session_label}`\n")
             if llm_model:
                 f.write(f"- LLM: `{llm_model}`\n")
             if prompt_label:
@@ -1093,7 +1109,7 @@ class LiveTranscriber:
             f.write("## Full Transcript\n\n")
             for line in self.transcript_lines:
                 f.write(line + "\n")
-        return notes_path
+        return str(notes_path)
 LOG_PATH: Optional[str] = None
 def _log(msg: str):
     try:
@@ -2064,6 +2080,7 @@ def main():
     parser.add_argument("-C", "--context", dest="context", action="append", help="File, directory, or http(s) URL to use as context (.pdf, .md, .txt, webpages). Can repeat.")
     parser.add_argument("--debug", dest="debug", action="store_true", help="Enable verbose logging to assistant.log")
     parser.add_argument("--post-chat", dest="post_chat", action="store_true", help="After recording, open a chat over the captured transcript.")
+    parser.add_argument("--session-name", dest="session_name", help="Human-readable session name used for storage and metadata.")
     args, unknown = parser.parse_known_args()
     interactive = sys.stdin.isatty()
     # Set global debug toggle (log file will be created once session_dir is known)
@@ -2150,9 +2167,26 @@ def main():
         else:
             print("[=] Proceeding without Vosk ASR (recording only).")
             dbg("No Vosk model selected; recording-only mode")
-    session_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    session_dir = os.path.expanduser(os.path.join("~", "recordings", f"session_{session_ts}"))
-    os.makedirs(session_dir, exist_ok=True)
+    session_name_input = args.session_name or os.environ.get("SESSION_NAME")
+    if interactive and session_name_input is None:
+        try:
+            session_name_input = input("Session name (blank for default): ").strip()
+        except EOFError:
+            session_name_input = ""
+    session_name_input = (session_name_input or "").strip()
+    session_slug = _slugify(session_name_input) if session_name_input else "session"
+    session_date = datetime.now().strftime("%Y-%m-%d")
+    recordings_root = Path.home() / "recordings"
+    recordings_root.mkdir(parents=True, exist_ok=True)
+    candidate = recordings_root / f"{session_slug}_{session_date}"
+    counter = 2
+    while candidate.exists():
+        candidate = recordings_root / f"{session_slug}_{session_date}-{counter}"
+        counter += 1
+    candidate.mkdir(parents=True, exist_ok=True)
+    session_dir_path = candidate
+    session_dir = str(session_dir_path)
+    session_display_name = session_name_input or candidate.name.replace('_', ' ')
     llm_model = args.llm_model or (cfg.get('llm_model') if isinstance(cfg.get('llm_model'), str) else None) or os.environ.get("LLM_MODEL") or os.environ.get("OPENAI_MODEL") or "gpt-4o-mini"
     api_key = os.environ.get("OPENAI_API_KEY")
     base_url = args.openai_base_url or (cfg.get('openai_base_url') if isinstance(cfg.get('openai_base_url'), str) else None) or os.environ.get("OPENAI_BASE_URL")
@@ -2182,7 +2216,7 @@ def main():
             api_key = entered
             os.environ["OPENAI_API_KEY"] = entered
     global LOG_PATH
-    LOG_PATH = os.path.join(session_dir, "assistant.log")
+    LOG_PATH = str(session_dir_path / "assistant.log")
     try:
         with open(LOG_PATH, "w", encoding="utf-8") as f:
             f.write("Live Assistant log\n")
@@ -2210,7 +2244,7 @@ def main():
     state = SharedState()
     initial_entries = context_entry_ids if context_labels else []
     state.set_context_bundle(context_text or '', context_labels or [], initial_entries)
-    tr = LiveTranscriber(src, session_dir, model_path, on_text=state.add_text, on_partial=state.set_partial)
+    tr = LiveTranscriber(src, session_dir, model_path, session_label=session_display_name, on_text=state.add_text, on_partial=state.set_partial)
     reader_thread = tr.run()
     # Determine interview mode
     interview_mode = bool(summary_prompt_label and 'interview' in summary_prompt_label.lower())
@@ -2343,5 +2377,6 @@ def main():
     else:
         notes_status("failed")
     print("[✓] Session complete.")
+    print(f"[=] Outputs directory: {session_dir_path}")
 if __name__ == "__main__":
     main()
