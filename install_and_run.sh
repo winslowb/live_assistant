@@ -49,6 +49,13 @@ done
 
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 
+pip_supports_break_system_packages() {
+  if ! command_exists python3; then
+    return 1
+  fi
+  PIP_PAGER=cat PIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip help install 2>/dev/null | grep -q -- '--break-system-packages'
+}
+
 ensure_apt_packages() {
   local pkgs=(ffmpeg pulseaudio-utils python3 python3-pip unzip wget poppler-utils)
   echo "[+] Installing system packages: ${pkgs[*]}"
@@ -71,11 +78,25 @@ install_system_packages() {
 
 install_pip_packages() {
   echo "[+] Installing Python packages"
-  if command_exists python3; then
-    python3 -m pip install --upgrade pip setuptools wheel --break-system-packages || true
-    python3 -m pip install --upgrade vosk requests --break-system-packages || true
-  else
-    echo "[!] python3 not found. Please install it first."; exit 1
+  if ! command_exists python3; then
+    echo "[!] python3 not found. Please install it first."
+    exit 1
+  fi
+  if ! python3 -m pip --version >/dev/null 2>&1; then
+    echo "[!] pip for python3 is unavailable. Install python3-pip and re-run."
+    exit 1
+  fi
+  local pip_args=()
+  if pip_supports_break_system_packages; then
+    pip_args+=(--break-system-packages)
+  fi
+  if ! python3 -m pip install --upgrade pip setuptools wheel "${pip_args[@]}"; then
+    echo "[!] Global pip upgrade failed; retrying with --user."
+    python3 -m pip install --upgrade --user pip setuptools wheel
+  fi
+  if ! python3 -m pip install --upgrade vosk requests "${pip_args[@]}"; then
+    echo "[!] Global package install failed; retrying with --user."
+    python3 -m pip install --upgrade --user vosk requests
   fi
 }
 
@@ -112,6 +133,20 @@ run_app() {
   fi
 }
 
+ensure_python_runtime() {
+  if ! command_exists python3; then
+    echo "[!] python3 not found. Please install it first."
+    exit 1
+  fi
+  if ! python3 -c 'import tomllib' >/dev/null 2>&1; then
+    local ver
+    ver=$(python3 --version 2>/dev/null || echo "Python (unknown version)")
+    echo "[!] ${ver} lacks the standard 'tomllib' module required by Live Assistant."
+    echo "    Install Python 3.11+ or run from an environment that provides tomllib."
+    exit 1
+  fi
+}
+
 echo "=== LiveAssistant Setup ==="
 
 if [[ $DO_INSTALL -eq 1 ]]; then
@@ -120,6 +155,8 @@ if [[ $DO_INSTALL -eq 1 ]]; then
 else
   echo "[=] Skipping package installations as requested"
 fi
+
+ensure_python_runtime
 
 MODEL_PATH_FINAL=""
 if [[ $DOWNLOAD_MODEL -eq 1 ]]; then
@@ -141,4 +178,3 @@ if [[ ! -f "$PY_SCRIPT" ]]; then
 fi
 
 run_app "$MODEL_PATH_FINAL"
-
