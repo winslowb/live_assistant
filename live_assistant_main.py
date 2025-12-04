@@ -242,6 +242,13 @@ def run_config_wizard(config_path: str | None) -> tuple[dict, str | None]:
     if not src:
         print("[!] No source selected. Exiting.")
         raise SystemExit(1)
+    mic = None
+    try:
+        add_mic = _prompt_yes_no("Add a microphone source to mix with system audio?", True)
+    except Exception:
+        add_mic = True
+    if add_mic:
+        mic = choose_from_list("Select microphone source (optional):", sources) if sources else None
     sink = choose_from_list("Select playback sink (optional):", sinks) if sinks else None
     use_vosk = bool(vosk) and _prompt_yes_no("Enable live transcription with Vosk?", True) if vosk else False
     model_path = choose_vosk_model_path() if use_vosk else None
@@ -293,6 +300,7 @@ def run_config_wizard(config_path: str | None) -> tuple[dict, str | None]:
     context = [c.strip() for c in ctx_line.split(',') if c.strip()] if ctx_line else []
     profile: dict[str, object] = {
         'source': src,
+        'mic': mic,
         'sink': sink,
         'vosk_model_path': model_path,
         'llm_model': llm_model,
@@ -904,8 +912,9 @@ class SharedState:
         with self.lock:
             return (list(self.actions), list(self.questions), list(self.decisions), list(self.topics))
 class LiveTranscriber:
-    def __init__(self, source: str, session_dir: str, model_path: Optional[str], *, session_label: Optional[str] = None, on_text=None, on_partial=None):
+    def __init__(self, source: str, session_dir: str, model_path: Optional[str], *, mic: Optional[str] = None, session_label: Optional[str] = None, on_text=None, on_partial=None):
         self.source = source
+        self.mic = mic
         self.session_dir = session_dir
         self.session_path = Path(session_dir)
         self.model_path = model_path
@@ -934,7 +943,7 @@ class LiveTranscriber:
             except Exception as e:
                 print(f"[!] Failed to init Vosk: {e}")
                 self.has_vosk = False
-        dbg(f"LiveTranscriber init: source={self.source} has_vosk={self.has_vosk} engine={self.engine_label}")
+        dbg(f"LiveTranscriber init: source={self.source} mic={self.mic} has_vosk={self.has_vosk} engine={self.engine_label}")
     def _open_wave(self):
         wav_path = self.session_path / "audio.wav"
         wf = wave.open(str(wav_path), 'wb')
@@ -951,12 +960,22 @@ class LiveTranscriber:
             _log(f"Failed to open transcript file: {e}")
             self._transcript_fh = None
     def _spawn_ffmpeg(self):
-        cmd = [
-            "ffmpeg", "-hide_banner", "-loglevel", "error",
-            "-f", "pulse", "-i", self.source,
-            "-ac", "1", "-ar", "16000",
-            "-f", "s16le", "-"
-        ]
+        if self.mic:
+            cmd = [
+                "ffmpeg", "-hide_banner", "-loglevel", "error",
+                "-thread_queue_size", "512", "-f", "pulse", "-i", self.source,
+                "-thread_queue_size", "512", "-f", "pulse", "-i", self.mic,
+                "-filter_complex", "[0:a]volume=0.4[a0];[1:a]volume=1.0[a1];[a0][a1]amix=inputs=2:duration=longest:normalize=1:dropout_transition=2",
+                "-ac", "1", "-ar", "16000",
+                "-f", "s16le", "-"
+            ]
+        else:
+            cmd = [
+                "ffmpeg", "-hide_banner", "-loglevel", "error",
+                "-f", "pulse", "-i", self.source,
+                "-ac", "1", "-ar", "16000",
+                "-f", "s16le", "-"
+            ]
         self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         dbg(f"Spawned ffmpeg: {' '.join(cmd)} (pid={self.proc.pid if self.proc else 'n/a'})")
     def _sec(self) -> float:
@@ -2148,6 +2167,7 @@ def main():
     parser.add_argument("--config", dest="config", help="Path to TOML config (default: XDG/~/.config/live_assistant/config.toml)")
     parser.add_argument("--profile", dest="profile", help="Profile name in config (default/env: LIVE_ASSISTANT_PROFILE or 'default')")
     parser.add_argument("--source", dest="source", help="PulseAudio source name (capture)")
+    parser.add_argument("--mic", dest="mic", help="PulseAudio microphone source name to mix with --source (optional)")
     parser.add_argument("--sink", dest="sink", help="PulseAudio sink name (playback)")
     parser.add_argument("--vosk-model-path", dest="vosk_model_path", help="Path to Vosk model directory")
     parser.add_argument("--llm-model", dest="llm_model", help="LLM model name (e.g., gpt-4o-mini)")
@@ -2218,6 +2238,16 @@ def main():
         return
     else:
         dbg(f"Using source: {src}")
+    mic = args.mic or (cfg.get('mic') if isinstance(cfg.get('mic'), str) else None)
+    if not mic and interactive:
+        try:
+            want_mic = _prompt_yes_no("Mix in a microphone source with system audio?", False)
+        except Exception:
+            want_mic = False
+        if want_mic:
+            mic = choose_from_list("Select microphone source (optional):", sources) if sources else None
+            if mic:
+                print(f"[=] Mic selected: {mic}")
     sink = args.sink or (cfg.get('sink') if isinstance(cfg.get('sink'), str) else None)
     if not sink and sinks and interactive:
         sink = choose_from_list("Select playback sink (optional):", sinks)
@@ -2311,7 +2341,7 @@ def main():
     state = SharedState()
     initial_entries = context_entry_ids if context_labels else []
     state.set_context_bundle(context_text or '', context_labels or [], initial_entries)
-    tr = LiveTranscriber(src, session_dir, model_path, session_label=session_display_name, on_text=state.add_text, on_partial=state.set_partial)
+    tr = LiveTranscriber(src, session_dir, model_path, mic=mic, session_label=session_display_name, on_text=state.add_text, on_partial=state.set_partial)
     reader_thread = tr.run()
     # Determine interview mode
     interview_mode = bool(summary_prompt_label and 'interview' in summary_prompt_label.lower())

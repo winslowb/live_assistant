@@ -35,6 +35,7 @@ The app will prompt for capture/playback devices and an optional LLM model. Note
 
 **CLI Flags**
 - `--source` `<pulse_source_name>` – capture source (e.g., a monitor for system audio)
+- `--mic` `<pulse_source_name>` – optional microphone source to mix with `--source`
 - `--sink` `<pulse_sink_name>` – playback sink (optional)
 - `--vosk-model-path` `<dir>` – Vosk model directory (enables live ASR)
 - `--llm-model` `<name>` – model name for analysis (e.g., `gpt-4o-mini`)

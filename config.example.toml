@@ -2,6 +2,8 @@
 # PulseAudio device names (use `pactl list short sources|sinks`)
 source = "alsa_output.pci-0000_00_1f.3.analog-stereo.monitor"
 sink = "alsa_output.pci-0000_00_1f.3.analog-stereo"
+# Optional microphone to mix with system audio
+mic = "alsa_input.pci-0000_00_1f.3.analog-stereo"
 
 # On‑device ASR (optional)
 vosk_model_path = "~/.cache/vosk-model-small-en-us-0.15"
@@ -28,8 +30,8 @@ debug = false
 [profiles.work]
 source = "alsa_output.usb-Logitech_USB_Headset-00.analog-stereo.monitor"
 sink   = "alsa_output.pci-0000_2f_00.4.hdmi-stereo-extra1"
+mic    = "alsa_input.usb-Logitech_USB_Headset-00.analog-stereo"
 vosk_model_path = "~/.cache/vosk-model-en-us-0.22"
 llm_model = "gpt-4o-mini"
 context = ["~/work/meeting-brief.md", "https://intranet.example.com/project-plan"]
 debug = true
-
