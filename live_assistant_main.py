@@ -6,6 +6,7 @@ import json
 import threading
 import queue
 import subprocess
+from collections import deque
 from datetime import datetime
 import curses
 import textwrap
@@ -694,7 +695,8 @@ def load_chat_prompt() -> tuple[str, str]:
 class SharedState:
     def __init__(self):
         self.lock = threading.Lock()
-        self.transcript = []
+        # Keep a bounded in-memory transcript for UI/analysis; full text is streamed to disk by LiveTranscriber.
+        self.transcript: deque[str] = deque(maxlen=4000)
         self.partial = ''
         self.analysis = ''
         self.actions = []
@@ -747,6 +749,13 @@ class SharedState:
     def snapshot(self):
         with self.lock:
             return list(self.transcript), self.analysis, self.partial
+    def snapshot_tail(self, max_lines: int = 200) -> Tuple[List[str], str, str]:
+        """Cheap tail-only snapshot for analyzer to avoid copying the full buffer."""
+        with self.lock:
+            if max_lines >= len(self.transcript):
+                return list(self.transcript), self.analysis, self.partial
+            tail = list(self.transcript)[-max_lines:]
+            return tail, self.analysis, self.partial
     # Interview helpers
     def start_segment(self):
         with self.lock:
@@ -901,13 +910,16 @@ class LiveTranscriber:
         self.session_path = Path(session_dir)
         self.model_path = model_path
         self.stop_event = threading.Event()
-        self.transcript_lines: List[str] = []
+        # Bounded in-memory transcript for UI/chat; full text persisted to disk.
+        self.transcript_lines: deque[str] = deque(maxlen=4000)
         self.markers: List[Tuple[float, str]] = []
         self.notes: List[Tuple[float, str]] = []
         self.start_time = time.time()
         self.engine_label = "none"
         self.proc: Optional[subprocess.Popen] = None
         self.writer: Optional[wave.Wave_write] = None
+        self.transcript_path: Optional[Path] = None
+        self._transcript_fh = None
         self.on_text = on_text
         self.on_partial = on_partial
         self.has_vosk = False
@@ -931,6 +943,13 @@ class LiveTranscriber:
         wf.setframerate(16000)
         self.writer = wf
         dbg(f"Opened WAV for writing: {wav_path}")
+    def _open_transcript_file(self):
+        self.transcript_path = self.session_path / "transcript_full.txt"
+        try:
+            self._transcript_fh = open(self.transcript_path, "w", encoding="utf-8")
+        except Exception as e:
+            _log(f"Failed to open transcript file: {e}")
+            self._transcript_fh = None
     def _spawn_ffmpeg(self):
         cmd = [
             "ffmpeg", "-hide_banner", "-loglevel", "error",
@@ -951,11 +970,23 @@ class LiveTranscriber:
     def run(self) -> threading.Thread:
         self.session_path.mkdir(parents=True, exist_ok=True)
         self._open_wave()
+        self._open_transcript_file()
         self._spawn_ffmpeg()
         if not self.proc or not self.proc.stdout:
             print("[!] Failed to start ffmpeg.")
             _log("ffmpeg start failed: no proc/stdout")
             return threading.Thread(target=lambda: None)
+        # Drain ffmpeg stderr so the pipe cannot block; log for troubleshooting.
+        def stderr_reader():
+            if not self.proc or not self.proc.stderr:
+                return
+            for raw_line in self.proc.stderr:
+                try:
+                    line = raw_line.decode('utf-8', errors='ignore').strip()
+                except Exception:
+                    line = str(raw_line).strip()
+                if line:
+                    _log(f"ffmpeg: {line}")
         def reader():
             try:
                 dbg("Reader thread started")
@@ -972,6 +1003,12 @@ class LiveTranscriber:
                                 txt = res.get("text", "").strip()
                                 if txt:
                                     self.transcript_lines.append(txt)
+                                    if self._transcript_fh:
+                                        try:
+                                            self._transcript_fh.write(txt + "\n")
+                                            self._transcript_fh.flush()
+                                        except Exception:
+                                            pass
                                     dbg(f"ASR final line len={len(txt)}")
                                     if self.on_text:
                                         try:
@@ -1004,12 +1041,42 @@ class LiveTranscriber:
                     if self.writer:
                         self.writer.close()
                         dbg("Closed WAV writer")
+                    if self._transcript_fh:
+                        self._transcript_fh.close()
                 except Exception:
                     pass
+        t_stderr = threading.Thread(target=stderr_reader, daemon=True)
+        t_stderr.start()
         t_reader = threading.Thread(target=reader, daemon=True)
         t_reader.start()
         dbg("Reader thread launched")
         return t_reader
+    def get_recent_transcript_lines(self, max_lines: int = 4000) -> List[str]:
+        """Return a tail of the in-memory transcript buffer."""
+        if max_lines >= len(self.transcript_lines):
+            return list(self.transcript_lines)
+        return list(self.transcript_lines)[-max_lines:]
+    def read_transcript_tail_text(self, max_chars: int = 20000) -> str:
+        """Read the tail of the persisted transcript for summaries without loading everything."""
+        path = self.transcript_path
+        if not path or not path.exists():
+            return "\n".join(self.get_recent_transcript_lines())[:max_chars]
+        try:
+            tail_lines = deque(path.open("r", encoding="utf-8", errors="ignore"), maxlen=4000)
+            text = "".join(tail_lines)
+            return text[-max_chars:] if len(text) > max_chars else text
+        except Exception:
+            return "\n".join(self.get_recent_transcript_lines())[:max_chars]
+    def read_full_transcript_lines(self, max_lines: int = 12000) -> List[str]:
+        """Return up to max_lines from the end of the full transcript file for chat/postmortems."""
+        path = self.transcript_path
+        if not path or not path.exists():
+            return self.get_recent_transcript_lines(max_lines)
+        try:
+            tail = deque(path.open("r", encoding="utf-8", errors="ignore"), maxlen=max_lines)
+            return list(tail)
+        except Exception:
+            return self.get_recent_transcript_lines(max_lines)
     def write_notes(self, source_label: str, sink_label: Optional[str], llm_model: Optional[str], analysis_text: Optional[str], lists: Optional[Tuple[List[str], List[str], List[str], List[str]]] = None, executive_summary: Optional[str] = None, prompt_label: Optional[str] = None, qas: Optional[List[Tuple[str, str]]] = None, chats: Optional[List[Tuple[str, str]]] = None, context_files: Optional[List[str]] = None, post_session_chats: Optional[List[Tuple[str, str]]] = None) -> Optional[str]:
         date_token = datetime.now().strftime("%Y-%m-%d")
         candidate = self.session_path / f"notes_{date_token}.md"
@@ -1107,8 +1174,16 @@ class LiveTranscriber:
                     f.write(f"- {t:0.1f}s: {text}\n")
                 f.write("\n")
             f.write("## Full Transcript\n\n")
-            for line in self.transcript_lines:
-                f.write(line + "\n")
+            transcript_iter: List[str] = []
+            if self.transcript_path and self.transcript_path.exists():
+                try:
+                    transcript_iter = self.transcript_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+                except Exception:
+                    transcript_iter = []
+            if not transcript_iter:
+                transcript_iter = list(self.transcript_lines)
+            for line in transcript_iter:
+                f.write(line.rstrip("\n") + "\n")
         return str(notes_path)
 LOG_PATH: Optional[str] = None
 def _log(msg: str):
@@ -1505,7 +1580,7 @@ def analyzer_loop(state: SharedState, api_key: Optional[str], base_url: Optional
         topics = [t for t, _ in sorted(freq.items(), key=lambda kv: (-kv[1], kv[0]))[:10]]
         return actions[:5], questions[:5], decisions[:5], topics
     while not stop_event.is_set():
-        transcript, _, partial = state.snapshot()
+        transcript, _, partial = state.snapshot_tail(120)
         snippet = ("\n".join(transcript[-60:]) + ("\n" + partial if partial else "")).strip()
         if snippet:
             dbg(f"Analyzer tick: snippet_len={len(snippet)} use_prompt={bool(prompt_md)}")
@@ -2103,14 +2178,6 @@ def main():
             print(f"[=] Config: profile '{cfg_name}' from {cfg_path}")
     except Exception:
         pass
-    # Show which profile/path were selected (helps troubleshoot typos)
-    try:
-        cfg_path = cfg.get('_config_path')
-        cfg_name = cfg.get('_profile')
-        if isinstance(cfg_path, str) and Path(cfg_path).exists():
-            print(f"[=] Config: profile '{cfg_name}' from {cfg_path}")
-    except Exception:
-        pass
     # Export prompt env overrides from config if not already set
     if not os.environ.get('PROMPT_DIR') and isinstance(cfg.get('prompt_dir'), str):
         os.environ['PROMPT_DIR'] = str(cfg['prompt_dir'])
@@ -2272,7 +2339,7 @@ def main():
     ctx_text_final, ctx_labels_final = state.get_context()
     prepare_done = _status_step("  • Preparing transcript… ")
     try:
-        full_text = "\n".join(tr.transcript_lines)
+        full_text = tr.read_transcript_tail_text(max_chars=50000)
         prepare_done()
     except Exception:
         full_text = None
@@ -2348,7 +2415,7 @@ def main():
         if start_post_chat:
             _restore_terminal_state()
             post_chat_pairs = post_session_chat_loop(
-                tr.transcript_lines,
+                tr.read_full_transcript_lines(),
                 ctx_text_final or None,
                 ctx_labels_final or [],
                 api_key=api_key,
